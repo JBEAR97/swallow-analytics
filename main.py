@@ -79,7 +79,7 @@ async def stats_minute():
         with engine.begin() as conn:
             result = conn.execute(text("""
                 SELECT 
-                    date_trunc('minute', ts_utc) AS minute,
+                    date_trunc('minute', ts_utc::timestamp) AS minute,
                     event_type,
                     COUNT(*) AS count,
                     COUNT(DISTINCT page_path) AS pages
