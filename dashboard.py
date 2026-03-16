@@ -6,6 +6,8 @@ from sqlalchemy import create_engine, text
 import os
 import numpy as np
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
+load_dotenv()
 
 # DATABASE_URL da Railway
 DATABASE_URL = os.getenv("DATABASE_URL")
