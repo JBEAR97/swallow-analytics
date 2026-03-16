@@ -30,3 +30,4 @@ test_*.py
 # Local DB
 *.db
 *.sqlite
+main.py
