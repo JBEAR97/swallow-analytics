@@ -1,5 +1,14 @@
 [build]
   builder = "NIXPACKS"
 
-[deploy]
-  startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
+# Servizio FastAPI (main)
+[[services]]
+service = "fastapi"  # ID servizio Railway CLI: railway service ls
+deploy = { startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT" }
+
+# Servizio Dashboard Streamlit
+[[services]]
+service = "dashboard"
+build = { ignoreFile = ".railwayignore" }  # Ignora main.py
+deploy = { startCommand = "streamlit run dashboard.py --server.port $PORT --server.address 0.0.0.0 --server.headless true --server.enableCORS false" }
+

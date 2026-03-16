@@ -5,7 +5,13 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY dashboard.py .
-COPY .railwayignore .env Procfile railway.json .  # opzionali
 
-EXPOSE $PORT
-CMD ["streamlit", "run", "dashboard.py", "--server.port=$PORT", "--server.address=0.0.0.0", "--server.headless=true", "--server.enableCORS=false"]
+# Se hai .env per DATABASE_URL, copialo; altrimenti gestisci in Railway vars
+# COPY .env .
+
+EXPOSE 8501
+CMD ["streamlit", "run", "dashboard.py", \
+     "--server.port=8501", \
+     "--server.address=0.0.0.0", \
+     "--server.headless=true", \
+     "--server.enableCORS=false"]
