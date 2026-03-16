@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 # Carica .env per test locali
 load_dotenv()
 
+BLOCKED_REF_SUBSTR = "https://orca-tetra-d4nz.squarespace.com"
+
 app = FastAPI(title="Swallow's Notes Analytics")
 
 # DATABASE_URL: Railway lo imposta automaticamente, .env per locale
@@ -34,6 +36,11 @@ async def track_event(request: Request):
     """Registra evento: page_view o impression"""
     try:
         data = await request.json()
+        
+        # NUOVO: Filtra Squarespace preview referrer
+        ref = (data.get("referrer") or "").lower()
+        if BLOCKED_REF_SUBSTR in ref:
+            return {"status": "ignored", "reason": "squarespace_preview_referrer"}
         
         # Validazione minima
         required = ["event_type", "page_path", "ts_utc"]
@@ -64,7 +71,7 @@ async def track_event(request: Request):
             )
         
         return {"status": "✅ OK", "event": data["event_type"]}
-        
+    
     except ValueError as e:
         raise HTTPException(422, f"❌ Formato data: {e}")
     except SQLAlchemyError as e:
