@@ -6,8 +6,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY dashboard.py .
 
-EXPOSE $PORT
-CMD sh -c "streamlit run dashboard.py \
-  --server.port=$$PORT \
-  --server.address=0.0.0.0 \
-  --server.headless=true"
+CMD ["streamlit", "run", "dashboard.py", "--server.address=0.0.0.0", "--server.headless=true"]
