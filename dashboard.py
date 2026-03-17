@@ -23,7 +23,7 @@ engine = create_engine(
 
 st.set_page_config(page_title="Swallow Analytics", layout="wide")
 
-st.title("🦌 Swallow's Notes Analytics")
+st.title("Swallow's Notes Analytics")
 st.markdown("---")
 
 # Sidebar refresh
