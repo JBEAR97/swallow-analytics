@@ -7,12 +7,39 @@ import os
 import numpy as np
 from datetime import datetime, timedelta
 import time  # ← AGGIUNTO per retry
+import urllib.parse  # ← AGGIUNTO per URL encoding password
 
-# DATABASE_URL da Railway Variables (${{Postgres.DATABASE_URL}})
-DATABASE_URL = os.getenv("DATABASE_URL")
+
+def build_database_url():
+    """Build DATABASE_URL da env vars Railway Postgres o fallback"""
+    pg_host = os.getenv('PGHOST', 'postgres.railway.internal')
+    pg_port = os.getenv('PGPORT', '5432')
+    pg_user = os.getenv('PGUSER', os.getenv('USER', 'postgres'))
+    pg_password = os.getenv('PGPASSWORD')
+    pg_database = os.getenv('PGDATABASE', 'railway')
+    
+    # Se tutte le PG* vars sono settate, build URL
+    if all([pg_host, pg_port, pg_user, pg_password, pg_database]):
+        # Encode password per caratteri speciali
+        encoded_password = urllib.parse.quote_plus(pg_password)
+        return f"postgresql://{pg_user}:{encoded_password}@{pg_host}:{pg_port}/{pg_database}"
+    
+    # Fallback a DATABASE_URL reference var
+    db_url = os.getenv("DATABASE_URL")
+    if db_url:
+        return db_url
+    
+    return None
+
+
+# DATABASE_URL dinamica (fix Railway + locale)
+DATABASE_URL = build_database_url()
 if not DATABASE_URL:
-    st.error("❌ DATABASE_URL mancante. Imposta '${{Postgres.DATABASE_URL}}' in Railway > dashboard > Variables.")
+    st.error("❌ DATABASE_URL non trovata.\n\n**Railway:** Aggiungi `${{Postgres.DATABASE_URL}}` in Variables.\n**Locale:** Crea `.env` con `PGHOST=postgres.railway.internal:5432 PGPORT=5432 PGUSER=postgres PGPASSWORD=xxx PGDATABASE=railway`")
     st.stop()
+else:
+    st.success(f"✅ DATABASE_URL: {DATABASE_URL[:40]}...")
+
 
 # Engine con pool_pre_ping (fix timeout Railway/Postgres)
 engine = create_engine(
@@ -22,18 +49,23 @@ engine = create_engine(
     echo=False
 )
 
+
 st.set_page_config(page_title="Swallow Analytics", layout="wide")
+
 
 st.title("Swallow's Notes Analytics")
 st.markdown("---")
+
 
 # Sidebar refresh
 if 'last_refresh' not in st.session_state:
     st.session_state.last_refresh = datetime.now()
 
+
 if st.button("🔄 Refresh (auto 10min)") or (datetime.now() - st.session_state.last_refresh).total_seconds() > 600:
     st.session_state.last_refresh = datetime.now()
     st.rerun()
+
 
 # Query helper RETRY + cache (← FIX PRINCIPALE)
 @st.cache_data(ttl=600)  # 10min cache
@@ -68,9 +100,11 @@ def get_data(days=7, max_retries=3):
                 'unique_pages': np.random.randint(1, 3, 20)
             })
 
+
 # Metrics cards
 today = get_data(days=1)
 col1, col2, col3, col4 = st.columns(4)
+
 
 if not today.empty and 'event_type' in today.columns:
     total_views = int(today[today['event_type'] == 'page_view']['count'].sum() or 0)
@@ -79,10 +113,12 @@ if not today.empty and 'event_type' in today.columns:
 else:
     total_views = total_impressions = pages = 0
 
+
 with col1: st.metric("👀 Page Views (24h)", total_views)
 with col2: st.metric("📖 Impressions (24h)", total_impressions)
 with col3: st.metric("📄 Pagine Uniche", pages)
 with col4: st.metric("⏰ Ultimo Update", st.session_state.last_refresh.strftime("%H:%M"))
+
 
 # Debug (opzionale)
 if st.checkbox("🔍 Debug dati"):
@@ -90,8 +126,10 @@ if st.checkbox("🔍 Debug dati"):
     st.write("**event_types:**", sorted(today['event_type'].unique()))
     st.dataframe(today.head(10))
 
+
 # Grafici
 tab1, tab2, tab3 = st.tabs(["📊 Ultima Ora", "📈 24h", "📅 7 Giorni"])
+
 
 with tab1:
     df_hour = get_data(days=1/24)
@@ -100,11 +138,13 @@ with tab1:
                      title="Traffico per Minuto", markers=True)
         st.plotly_chart(fig, width='stretch')
 
+
 with tab2:
     df_day = get_data(1)
     if not df_day.empty:
         fig2 = px.bar(df_day, x='minute', y='count', color='event_type', title="24h Dettaglio")
         st.plotly_chart(fig2, width='stretch')
+
 
 with tab3:
     df_week = get_data(7)
@@ -112,20 +152,19 @@ with tab3:
         fig3 = px.area(df_week, x='minute', y='count', color='event_type', title="Trend Settimanale")
         st.plotly_chart(fig3, width='stretch')
 
-# Top pages
+
+# Top pages MIGLIORATO con retry
 st.subheader("🥇 Top Pagine (24h)")
 try:
-    with engine.connect() as conn:
-        df_pages = pd.read_sql(text("""
-            SELECT page_path, COUNT(*) as views 
-            FROM "swallow-analysis" 
-            WHERE ts_utc >= NOW() - INTERVAL '1 day' AND event_type='page_view'
-            GROUP BY page_path ORDER BY views DESC LIMIT 10
-        """), conn)
+    df_pages = get_data(days=1, max_retries=2)  # Reuse cached + retry
     if not df_pages.empty:
-        st.bar_chart(df_pages.set_index('page_path')['views'])
+        top_pages = df_pages[df_pages['event_type'] == 'page_view'].groupby('unique_pages')['count'].sum().nlargest(10)
+        if not top_pages.empty:
+            st.bar_chart(top_pages)
+        else:
+            st.info("📭 Nessuna page_view nelle 24h")
     else:
-        st.info("📭 Nessuna page_view nelle 24h")
+        st.info("📭 Dati non disponibili")
 except:
     st.info("📭 Top pages temporaneamente non disponibile")
 
