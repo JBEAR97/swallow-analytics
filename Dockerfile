@@ -8,7 +8,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN apt-get update && apt-get install -y postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
-COPY main.py dashboard.py .
+COPY main.py dashboard.py ./
 
 # Default to FastAPI (will be overridden by startCommand in railway.toml)
 CMD uvicorn main:app --host 0.0.0.0 --port $PORT
