@@ -6,9 +6,8 @@ from sqlalchemy import create_engine, text
 import os
 import numpy as np
 from datetime import datetime, timedelta
-import time  # ← AGGIUNTO per retry
-import urllib.parse  # ← AGGIUNTO per URL encoding password
-
+import time
+import urllib.parse
 
 def build_database_url():
     """Build DATABASE_URL da env vars Railway Postgres o fallback"""
@@ -18,57 +17,45 @@ def build_database_url():
     pg_password = os.getenv('PGPASSWORD')
     pg_database = os.getenv('PGDATABASE', 'railway')
     
-    # Se tutte le PG* vars sono settate, build URL
     if all([pg_host, pg_port, pg_user, pg_password, pg_database]):
-        # Encode password per caratteri speciali
         encoded_password = urllib.parse.quote_plus(pg_password)
         return f"postgresql://{pg_user}:{encoded_password}@{pg_host}:{pg_port}/{pg_database}"
     
-    # Fallback a DATABASE_URL reference var
     db_url = os.getenv("DATABASE_URL")
     if db_url:
         return db_url
     
     return None
 
-
-# DATABASE_URL dinamica (fix Railway + locale)
+# DATABASE_URL dinamica
 DATABASE_URL = build_database_url()
 if not DATABASE_URL:
-    st.error("❌ DATABASE_URL non trovata.\n\n**Railway:** Aggiungi `${{Postgres.DATABASE_URL}}` in Variables.\n**Locale:** Crea `.env` con `PGHOST=postgres.railway.internal:5432 PGPORT=5432 PGUSER=postgres PGPASSWORD=xxx PGDATABASE=railway`")
+    st.error("❌ DATABASE_URL non trovata.\n\n**Railway:** `${{mainline.DATABASE_URL}}`\n**Locale:** PGHOST=mainline.proxy.rlwy.net:50632 etc.")
     st.stop()
 else:
     st.success(f"✅ DATABASE_URL: {DATABASE_URL[:40]}...")
 
-
-# Engine con pool_pre_ping (fix timeout Railway/Postgres)
 engine = create_engine(
     DATABASE_URL, 
     pool_pre_ping=True, 
-    pool_recycle=300,  # Ricicla conn ogni 5min
+    pool_recycle=300,
     echo=False
 )
 
-
 st.set_page_config(page_title="Swallow Analytics", layout="wide")
-
 
 st.title("Swallow's Notes Analytics")
 st.markdown("---")
 
-
-# Sidebar refresh
 if 'last_refresh' not in st.session_state:
     st.session_state.last_refresh = datetime.now()
-
 
 if st.button("🔄 Refresh (auto 10min)") or (datetime.now() - st.session_state.last_refresh).total_seconds() > 600:
     st.session_state.last_refresh = datetime.now()
     st.rerun()
 
-
-# Query helper RETRY + cache (← FIX PRINCIPALE)
-@st.cache_data(ttl=600)  # 10min cache
+# 🔧 FIX SQL: INTERVAL '1 day' * :days
+@st.cache_data(ttl=600)
 def get_data(days=7, max_retries=3):
     for attempt in range(max_retries):
         try:
@@ -80,10 +67,10 @@ def get_data(days=7, max_retries=3):
                         COUNT(*) as count,
                         COUNT(DISTINCT page_path) as unique_pages
                     FROM "swallow-analysis" 
-                    WHERE ts_utc >= NOW() - INTERVAL :days days
+                    WHERE ts_utc >= NOW() - INTERVAL '1 day' * :days  -- ← FIX QUI
                     GROUP BY 1,2 
                     ORDER BY 1 DESC
-                """), conn, params={'days': str(days)}, parse_dates=['minute'])
+                """), conn, params={'days': float(days)}, parse_dates=['minute'])  # ← float(days)
                 st.success(f"✅ Dati OK: {len(df)} righe, {df['event_type'].nunique()} eventi")
                 return df
         except Exception as e:
@@ -92,7 +79,6 @@ def get_data(days=7, max_retries=3):
                 time.sleep(1)
                 continue
             st.error(f"❌ DB fallito: {str(e)}")
-            # DATI DEMO per test UI
             return pd.DataFrame({
                 'minute': pd.date_range(end=datetime.now(), periods=20, freq='10min'),
                 'event_type': ['page_view']*12 + ['impression']*8,
@@ -100,11 +86,9 @@ def get_data(days=7, max_retries=3):
                 'unique_pages': np.random.randint(1, 3, 20)
             })
 
-
-# Metrics cards
+# Resto invariato...
 today = get_data(days=1)
 col1, col2, col3, col4 = st.columns(4)
-
 
 if not today.empty and 'event_type' in today.columns:
     total_views = int(today[today['event_type'] == 'page_view']['count'].sum() or 0)
@@ -113,50 +97,39 @@ if not today.empty and 'event_type' in today.columns:
 else:
     total_views = total_impressions = pages = 0
 
-
 with col1: st.metric("👀 Page Views (24h)", total_views)
 with col2: st.metric("📖 Impressions (24h)", total_impressions)
 with col3: st.metric("📄 Pagine Uniche", pages)
 with col4: st.metric("⏰ Ultimo Update", st.session_state.last_refresh.strftime("%H:%M"))
 
-
-# Debug (opzionale)
 if st.checkbox("🔍 Debug dati"):
     st.write("**today shape:**", today.shape)
     st.write("**event_types:**", sorted(today['event_type'].unique()))
     st.dataframe(today.head(10))
 
-
-# Grafici
 tab1, tab2, tab3 = st.tabs(["📊 Ultima Ora", "📈 24h", "📅 7 Giorni"])
 
-
 with tab1:
-    df_hour = get_data(days=1/24)
+    df_hour = get_data(1/24)  # 1 ora
     if not df_hour.empty:
-        fig = px.line(df_hour, x='minute', y='count', color='event_type', 
-                     title="Traffico per Minuto", markers=True)
-        st.plotly_chart(fig, width='stretch')
-
+        fig = px.line(df_hour, x='minute', y='count', color='event_type', title="Traffico per Minuto", markers=True)
+        st.plotly_chart(fig, use_container_width=True)
 
 with tab2:
     df_day = get_data(1)
     if not df_day.empty:
         fig2 = px.bar(df_day, x='minute', y='count', color='event_type', title="24h Dettaglio")
-        st.plotly_chart(fig2, width='stretch')
-
+        st.plotly_chart(fig2, use_container_width=True)
 
 with tab3:
     df_week = get_data(7)
     if not df_week.empty:
         fig3 = px.area(df_week, x='minute', y='count', color='event_type', title="Trend Settimanale")
-        st.plotly_chart(fig3, width='stretch')
+        st.plotly_chart(fig3, use_container_width=True)
 
-
-# Top pages MIGLIORATO con retry
 st.subheader("🥇 Top Pagine (24h)")
 try:
-    df_pages = get_data(days=1, max_retries=2)  # Reuse cached + retry
+    df_pages = get_data(1)
     if not df_pages.empty:
         top_pages = df_pages[df_pages['event_type'] == 'page_view'].groupby('unique_pages')['count'].sum().nlargest(10)
         if not top_pages.empty:
@@ -166,5 +139,5 @@ try:
     else:
         st.info("📭 Dati non disponibili")
 except:
-    st.info("📭 Top pages temporaneamente non disponibile")
+    st.info("📭 Top pages non disponibile")
 
