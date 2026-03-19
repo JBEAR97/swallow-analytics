@@ -7,13 +7,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from datetime import datetime
 import os
 from dotenv import load_dotenv
+from contextlib import asynccontextmanager
 
 # Carica .env per test locali
 load_dotenv()
 
 BLOCKED_REF_SUBSTR = "https://orca-tetra-d4nz.squarespace.com"
-
-app = FastAPI(title="Swallow's Notes Analytics")
 
 # DATABASE_URL: Railway lo imposta automaticamente, .env per locale
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -21,6 +20,46 @@ if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL mancante! Imposta in .env o Railway.")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+def run_migrations():
+    """Run database migrations on startup"""
+    try:
+        with engine.begin() as conn:
+            # Check if created_at column exists
+            result = conn.execute(text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'swallow-analysis' 
+                AND column_name = 'created_at'
+            """))
+            
+            if not result.fetchone():
+                # Column doesn't exist, add it
+                conn.execute(text("""
+                    ALTER TABLE "swallow-analysis"
+                    ADD COLUMN created_at TIMESTAMP DEFAULT NOW()
+                """))
+                
+                # Update existing rows to use ts_utc value
+                conn.execute(text("""
+                    UPDATE "swallow-analysis"
+                    SET created_at = ts_utc
+                """))
+                print("✅ Migration: added created_at column and backfilled data")
+            else:
+                print("✅ Migration: created_at column already exists")
+    except Exception as e:
+        print(f"⚠️ Migration warning: {e}")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Run migrations
+    run_migrations()
+    yield
+    # Shutdown: nothing needed
+    pass
+
+app = FastAPI(title="Swallow's Notes Analytics", lifespan=lifespan)
 
 @app.get("/")
 async def health_check():
@@ -52,13 +91,15 @@ async def track_event(request: Request):
         if data["event_type"] not in ["page_view", "impression"]:
             raise HTTPException(400, "❌ event_type: solo 'page_view' o 'impression'")
         
+        ts_value = datetime.fromisoformat(data["ts_utc"].replace("Z", "+00:00"))
+        
         with engine.begin() as conn:
             conn.execute(
                 text("""
                     INSERT INTO "swallow-analysis" (
-                        event_type, page_path, referrer, user_agent, ts_utc
+                        event_type, page_path, referrer, user_agent, ts_utc, created_at
                     ) VALUES (
-                        :event_type, :page_path, :referrer, :user_agent, :ts_utc
+                        :event_type, :page_path, :referrer, :user_agent, :ts_utc, :created_at
                     )
                 """),
                 {
@@ -66,7 +107,8 @@ async def track_event(request: Request):
                     "page_path": data["page_path"][:500],  # Truncate lungo URLs
                     "referrer": data.get("referrer", "")[:500],
                     "user_agent": request.headers.get("user-agent", "")[:1000],
-                    "ts_utc": datetime.fromisoformat(data["ts_utc"].replace("Z", "+00:00"))
+                    "ts_utc": ts_value,
+                    "created_at": ts_value
                 }
             )
         
