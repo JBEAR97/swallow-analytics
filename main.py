@@ -40,12 +40,12 @@ def run_migrations():
                     ADD COLUMN created_at TIMESTAMP DEFAULT NOW()
                 """))
                 
-                # Update existing rows to use ts_utc value
+                # Update ALL existing rows to use ts_utc value
                 conn.execute(text("""
                     UPDATE "swallow-analysis"
                     SET created_at = ts_utc
                 """))
-                print("✅ Migration: added created_at column and backfilled data")
+                print("✅ Migration: added created_at column and backfilled ALL rows")
             else:
                 print("✅ Migration: created_at column already exists")
     except Exception as e:
@@ -53,10 +53,10 @@ def run_migrations():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Run migrations
+    # Startup
     run_migrations()
     yield
-    # Shutdown: nothing needed
+    # Shutdown
     pass
 
 app = FastAPI(title="Swallow's Notes Analytics", lifespan=lifespan)
@@ -91,15 +91,13 @@ async def track_event(request: Request):
         if data["event_type"] not in ["page_view", "impression"]:
             raise HTTPException(400, "❌ event_type: solo 'page_view' o 'impression'")
         
-        ts_value = datetime.fromisoformat(data["ts_utc"].replace("Z", "+00:00"))
-        
         with engine.begin() as conn:
             conn.execute(
                 text("""
                     INSERT INTO "swallow-analysis" (
-                        event_type, page_path, referrer, user_agent, ts_utc, created_at
+                        event_type, page_path, referrer, user_agent, ts_utc
                     ) VALUES (
-                        :event_type, :page_path, :referrer, :user_agent, :ts_utc, :created_at
+                        :event_type, :page_path, :referrer, :user_agent, :ts_utc
                     )
                 """),
                 {
@@ -107,8 +105,7 @@ async def track_event(request: Request):
                     "page_path": data["page_path"][:500],  # Truncate lungo URLs
                     "referrer": data.get("referrer", "")[:500],
                     "user_agent": request.headers.get("user-agent", "")[:1000],
-                    "ts_utc": ts_value,
-                    "created_at": ts_value
+                    "ts_utc": datetime.fromisoformat(data["ts_utc"].replace("Z", "+00:00"))
                 }
             )
         
