@@ -143,7 +143,7 @@ if not df_countries.empty:
     )
     fig_bar.update_layout(yaxis={'categoryorder':'total descending'})
     fig_bar.update_traces(texttemplate='%{x}', textposition='outside')
-    st.plotly_chart(fig_bar, use_container_width=True)
+    st.plotly_chart(fig_bar, width='stretch')
     
     # Mappa Choropleth
     fig_map = px.choropleth(
@@ -152,7 +152,7 @@ if not df_countries.empty:
         labels={'count':'Visite'}, title=f"Mappa Mondo ({time_filter})"
     )
     fig_map.update_layout(geo=dict(showframe=False, showcoastlines=True, projection_type="natural earth"))
-    st.plotly_chart(fig_map, use_container_width=True)
+    st.plotly_chart(fig_map, width='stretch')
 else:
     st.info(f"Nessun dato per {time_filter}.")
 
@@ -169,19 +169,19 @@ with tab1:
     df_hour = get_data(1/24)
     if not df_hour.empty:
         fig = px.line(df_hour, x='minute', y='count', color='event_type', title="Traffico per Minuto", markers=True)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
 with tab2:
     df_day = get_data(1)
     if not df_day.empty:
         fig2 = px.bar(df_day, x='minute', y='count', color='event_type', title="24h Dettaglio")
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width='stretch')
 
 with tab3:
     df_week = get_data(7)
     if not df_week.empty:
         fig3 = px.area(df_week, x='minute', y='count', color='event_type', title="Trend Settimanale")
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width='stretch')
 
 st.subheader("🥇 Top Pagine (24h)")
 try:
