@@ -31,3 +31,6 @@ test_*.py
 *.db
 *.sqlite
 main.py
+
+!data/
+!data/GeoLite2-Country.mmdb
