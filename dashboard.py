@@ -148,48 +148,50 @@ with col3: st.metric("📄 Pagine Uniche", pages)
 with col4: st.metric("⏰ Ultimo Update", st.session_state.last_refresh.strftime("%H:%M"))
 
 
-# 🌍 GEOIP - Top Paesi + Mappa (AGGIORNATA con All-time)
+# 🌍 GEOIP - Top Paesi + Mappa (FIX MAPPA)
 st.subheader("🌍 GeoIP: Paesi Visitatori")
-time_filter = st.selectbox("Periodo:", ["1h", "24h", "7d", "🌍 All-time"], index=1)
+time_filter = st.selectbox("Periodo:", ["1h", "24h", "7d", "🌍 All-time"], index=3)  # Default All-time!
 days_map = {'1h': 1/24, '24h': 1, '7d': 7, '🌍 All-time': 99999}[time_filter]
 
 df_countries = get_countries(days_map)
 
-
 col_geo1, col_geo2 = st.columns(2)
 with col_geo1:
-    st.metric("Paesi Unici", df_countries['country_code'].nunique() if not df_countries.empty else 0)
+    st.metric("Paesi Unici", df_countries['country_code'].nunique())
 with col_geo2:
-    top_country = df_countries.iloc[0]['country_code'] if not df_countries.empty else 'ZZ'
-    top_count = df_countries.iloc[0]['count'] if not df_countries.empty else 0
-    st.metric("🥇 Top Paese", f"{top_country} ({top_count})")
+    if not df_countries.empty:
+        top_country = df_countries.iloc[0]['country_code']
+        top_count = df_countries.iloc[0]['count']
+        st.metric("🥇 Top Paese", f"{top_country} ({top_count})")
 
-
-if not df_countries.empty:
+if not df_countries.empty and len(df_countries) > 0:
     # Bar Chart
-    fig_bar = px.bar(
-        df_countries.head(10), x='count', y='country_code', orientation='h',
-        title=f"Top 10 Paesi ({time_filter})",
-        color='count', color_continuous_scale='Viridis'
-    )
+    fig_bar = px.bar(df_countries.head(10), x='count', y='country_code', orientation='h',
+                     title=f"Top 10 Paesi ({time_filter})", color='count', 
+                     color_continuous_scale='Viridis')
     fig_bar.update_layout(yaxis={'categoryorder':'total descending'})
     fig_bar.update_traces(texttemplate='%{x}', textposition='outside')
     st.plotly_chart(fig_bar, width=600)
     
-    # Mappa Choropleth (cumulativa All-time)
-    fig_map = px.choropleth(
-        df_countries, locations='country_code', color='count',
-        hover_name='country_code', hover_data={'count': ':.0f'},
-        color_continuous_scale='Viridis',
-        labels={'count':'Visite'}, 
-        title=f"🌍 Mappa Mondo ({time_filter})"
-    )
-    fig_map.update_layout(
-        geo=dict(showframe=False, showcoastlines=True, projection_type="natural earth")
-    )
-    st.plotly_chart(fig_map, use_container_width=True)
+    # MAPPA FIX: locationmode='ISO-2' + range_color
+    max_visits = df_countries['count'].max()
+    fig_map = px.choropleth(df_countries, 
+                            locations='country_code', 
+                            color='count',
+                            locationmode='ISO-2',  # CRITICO per ISO2!
+                            hover_name='country_code', 
+                            hover_data={'count': ':.0f'},
+                            color_continuous_scale='Viridis',
+                            range_color=[1, max_visits],  # Scala da 1 a max
+                            labels={'count':'Visite'}, 
+                            title=f"🌍 Mappa Mondo ({time_filter})")
+    fig_map.update_layout(geo=dict(showframe=False, showcoastlines=True, 
+                                   projection_type="natural earth"))
+    st.plotly_chart(fig_map, width='stretch')
+    
+    st.caption(f"Paesi: {', '.join(df_countries['country_code'].tolist())} | Max: {max_visits}")
 else:
-    st.info(f"Nessun dato per {time_filter}.")
+    st.info(f"⏳ Nessun dato GeoIP per '{time_filter}'. Controlla country_code in DB.")
 
 
 # Debug
@@ -207,21 +209,21 @@ with tab1:
     df_hour = get_data(1/24)
     if not df_hour.empty:
         fig = px.line(df_hour, x='minute', y='count', color='event_type', title="Traffico per Minuto", markers=True)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
 
 with tab2:
     df_day = get_data(1)
     if not df_day.empty:
         fig2 = px.bar(df_day, x='minute', y='count', color='event_type', title="24h Dettaglio")
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width='stretch')
 
 
 with tab3:
     df_week = get_data(7)
     if not df_week.empty:
         fig3 = px.area(df_week, x='minute', y='count', color='event_type', title="Trend Settimanale")
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width='stretch')
 
 
 st.subheader("🥇 Top Pagine (24h)")
