@@ -8,6 +8,20 @@ import numpy as np
 from datetime import datetime, timedelta
 import time
 import urllib.parse
+import pycountry  # pip install pycountry
+
+
+# 🌍 Mapping COMPLETO ISO2 → ISO3 (TUTTI i paesi)
+def get_iso2_to_iso3():
+    """Genera mapping dinamico TUTTI i paesi mondo"""
+    mapping = {}
+    for country in pycountry.countries:
+        mapping[country.alpha_2] = country.alpha_3
+    mapping['ZZ'] = 'ZZZ'  # Unknown
+    mapping['EU'] = 'EUR'  # Europe proxy
+    return mapping
+
+ISO2_TO_ISO3 = get_iso2_to_iso3()
 
 
 def build_database_url():
@@ -32,20 +46,13 @@ def build_database_url():
 # DATABASE_URL dinamica
 DATABASE_URL = build_database_url()
 if not DATABASE_URL:
-    st.error("❌ DATABASE_URL non trovata.\n\n**Railway:** `${{mainline.DATABASE_URL}}`\n**Locale:** PGHOST=mainline.proxy.rlwy.net:50632 etc.")
+    st.error("❌ DATABASE_URL non trovata.")
     st.stop()
 else:
     st.success(f"✅ DATABASE_URL: {DATABASE_URL[:40]}...")
 
 
-engine = create_engine(
-    DATABASE_URL, 
-    pool_pre_ping=True, 
-    pool_recycle=300,
-    echo=False
-)
-
-
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300, echo=False)
 st.set_page_config(page_title="Swallow Analytics", layout="wide")
 
 
@@ -56,91 +63,62 @@ st.markdown("---")
 if 'last_refresh' not in st.session_state:
     st.session_state.last_refresh = datetime.now()
 
-
 if st.button("🔄 Refresh (auto 10min)") or (datetime.now() - st.session_state.last_refresh).total_seconds() > 600:
     st.session_state.last_refresh = datetime.now()
     st.rerun()
 
 
-# 🔧 FUNZIONE get_data esistente
 @st.cache_data(ttl=600)
 def get_data(days=7, max_retries=3):
     for attempt in range(max_retries):
         try:
             with engine.connect() as conn:
                 df = pd.read_sql(text("""
-                    SELECT 
-                        date_trunc('minute', ts_utc::timestamptz) as minute,
-                        event_type,
-                        COUNT(*) as count,
-                        COUNT(DISTINCT page_path) as unique_pages
+                    SELECT date_trunc('minute', ts_utc::timestamptz) as minute,
+                           event_type, COUNT(*) as count,
+                           COUNT(DISTINCT page_path) as unique_pages
                     FROM "swallow-analysis" 
                     WHERE ts_utc >= NOW() - INTERVAL '1 day' * :days
-                    GROUP BY 1,2 
-                    ORDER BY 1 DESC
+                    GROUP BY 1,2 ORDER BY 1 DESC
                 """), conn, params={'days': float(days)}, parse_dates=['minute'])
-                st.success(f"✅ Dati OK: {len(df)} righe, {df['event_type'].nunique()} eventi")
                 return df
-        except Exception as e:
+        except:
             if attempt < max_retries - 1:
-                st.warning(f"🔄 DB retry {attempt+1}/3...")
                 time.sleep(1)
                 continue
-            st.error(f"❌ DB fallito: {str(e)}")
-            return pd.DataFrame({
-                'minute': pd.date_range(end=datetime.now(), periods=20, freq='10min'),
-                'event_type': ['page_view']*12 + ['impression']*8,
-                'count': np.random.randint(1, 50, 20),
-                'unique_pages': np.random.randint(1, 3, 20)
-            })
+            return pd.DataFrame()
 
 
-# 🌍 AGGIORNATA: Funzione GeoIP con All-time
 @st.cache_data(ttl=600)
 def get_countries(days, max_retries=3):
     for attempt in range(max_retries):
         try:
             with engine.connect() as conn:
                 if days > 10000:  # All-time
-                    query = """
-                        SELECT country_code, COUNT(*) as count
-                        FROM "swallow-analysis" 
-                        GROUP BY country_code
-                        ORDER BY count DESC
-                        LIMIT 20
-                    """
+                    query = 'SELECT country_code, COUNT(*) as count FROM "swallow-analysis" GROUP BY 1 ORDER BY 2 DESC LIMIT 50'
                     df = pd.read_sql(text(query), conn)
                 else:
                     query = """
                         SELECT country_code, COUNT(*) as count
                         FROM "swallow-analysis" 
                         WHERE ts_utc >= NOW() - INTERVAL '1 day' * :days
-                        GROUP BY country_code
-                        ORDER BY count DESC
-                        LIMIT 10
+                        GROUP BY 1 ORDER BY 2 DESC LIMIT 20
                     """
                     df = pd.read_sql(text(query), conn, params={'days': float(days)})
                 return df
-        except Exception as e:
+        except:
             if attempt < max_retries - 1:
                 time.sleep(1)
                 continue
-            st.error(f"❌ GeoIP query fallita: {str(e)}")
             return pd.DataFrame()
 
 
-# Metriche principali
+# Metriche
 today = get_data(days=1)
 col1, col2, col3, col4 = st.columns(4)
-
-
-if not today.empty and 'event_type' in today.columns:
-    total_views = int(today[today['event_type'] == 'page_view']['count'].sum() or 0)
-    total_impressions = int(today[today['event_type'] == 'impression']['count'].sum() or 0)
-    pages = int(today['unique_pages'].sum() or 0)
-else:
-    total_views = total_impressions = pages = 0
-
+total_views = int(today[today['event_type'] == 'page_view']['count'].sum() or 0) if not today.empty else 0
+total_impressions = int(today[today['event_type'] == 'impression']['count'].sum() or 0) if not today.empty else 0
+pages = int(today['unique_pages'].sum() or 0) if not today.empty else 0
 
 with col1: st.metric("👀 Page Views (24h)", total_views)
 with col2: st.metric("📖 Impressions (24h)", total_impressions)
@@ -148,9 +126,9 @@ with col3: st.metric("📄 Pagine Uniche", pages)
 with col4: st.metric("⏰ Ultimo Update", st.session_state.last_refresh.strftime("%H:%M"))
 
 
-# 🌍 GEOIP - Top Paesi + Mappa (FIX MAPPA)
+# 🌍 GEOIP COMPLETA (TUTTI PAESI)
 st.subheader("🌍 GeoIP: Paesi Visitatori")
-time_filter = st.selectbox("Periodo:", ["1h", "24h", "7d", "🌍 All-time"], index=3)  # Default All-time!
+time_filter = st.selectbox("Periodo:", ["1h", "24h", "7d", "🌍 All-time"], index=3)
 days_map = {'1h': 1/24, '24h': 1, '7d': 7, '🌍 All-time': 99999}[time_filter]
 
 df_countries = get_countries(days_map)
@@ -164,79 +142,60 @@ with col_geo2:
         top_count = df_countries.iloc[0]['count']
         st.metric("🥇 Top Paese", f"{top_country} ({top_count})")
 
-if not df_countries.empty and len(df_countries) > 0:
-    # Bar Chart
-    fig_bar = px.bar(df_countries.head(10), x='count', y='country_code', orientation='h',
-                     title=f"Top 10 Paesi ({time_filter})", color='count', 
+if not df_countries.empty:
+    if st.checkbox("🔍 Debug GeoIP"):
+        st.write("**Raw:**", df_countries)
+    
+    # ISO2 → ISO3 per TUTTI i paesi (pycountry)
+    df_map = df_countries.copy()
+    df_map['iso3'] = df_map['country_code'].map(ISO2_TO_ISO3)
+    
+    # Bar (tutti)
+    fig_bar = px.bar(df_countries.head(15), x='count', y='country_code', orientation='h',
+                     title=f"Top Paesi ({time_filter})", color='count', 
                      color_continuous_scale='Viridis')
     fig_bar.update_layout(yaxis={'categoryorder':'total descending'})
     fig_bar.update_traces(texttemplate='%{x}', textposition='outside')
-    st.plotly_chart(fig_bar, width=600)
+    st.plotly_chart(fig_bar, width=700)
     
-    # MAPPA FIX: locationmode='ISO-2' + range_color
-    max_visits = df_countries['count'].max()
-    fig_map = px.choropleth(df_countries, 
-                            locations='country_code', 
-                            color='count',
-                            locationmode='ISO-2',  # CRITICO per ISO2!
-                            hover_name='country_code', 
-                            hover_data={'count': ':.0f'},
-                            color_continuous_scale='Viridis',
-                            range_color=[1, max_visits],  # Scala da 1 a max
-                            labels={'count':'Visite'}, 
-                            title=f"🌍 Mappa Mondo ({time_filter})")
-    fig_map.update_layout(geo=dict(showframe=False, showcoastlines=True, 
-                                   projection_type="natural earth"))
-    st.plotly_chart(fig_map, width='stretch')
-    
-    st.caption(f"Paesi: {', '.join(df_countries['country_code'].tolist())} | Max: {max_visits}")
-else:
-    st.info(f"⏳ Nessun dato GeoIP per '{time_filter}'. Controlla country_code in DB.")
+    # MAPPA ISO3 (tutti mappati)
+    valid_map = df_map.dropna(subset=['iso3'])
+    if len(valid_map) > 0:
+        fig_map = px.choropleth(valid_map, 
+                                locations='iso3', color='count',
+                                locationmode='ISO-3',
+                                hover_name='country_code', hover_data={'count': ':.0f'},
+                                color_continuous_scale='Viridis',
+                                range_color=[1, valid_map['count'].max()],
+                                title=f"🌍 Mappa Mondo ({time_filter})")
+        fig_map.update_layout(geo=dict(showframe=False, showcoastlines=True))
+        st.plotly_chart(fig_map, width='stretch')
+        st.caption(f"✅ {len(valid_map)}/{len(df_countries)} paesi mappati | Max: {valid_map['count'].max()}")
+    else:
+        st.error("❌ Nessun paese mappato. pip install pycountry")
 
 
-# Debug
-if st.checkbox("🔍 Debug dati"):
-    st.write("**today shape:**", today.shape)
-    st.write("**Paesi:**", df_countries)
-    st.dataframe(today.head(10))
-
-
-# Tabs esistenti
+# Tabs
 tab1, tab2, tab3 = st.tabs(["📊 Ultima Ora", "📈 24h", "📅 7 Giorni"])
 
-
-with tab1:
-    df_hour = get_data(1/24)
-    if not df_hour.empty:
-        fig = px.line(df_hour, x='minute', y='count', color='event_type', title="Traffico per Minuto", markers=True)
-        st.plotly_chart(fig, width='stretch')
-
-
-with tab2:
-    df_day = get_data(1)
-    if not df_day.empty:
-        fig2 = px.bar(df_day, x='minute', y='count', color='event_type', title="24h Dettaglio")
-        st.plotly_chart(fig2, width='stretch')
-
-
-with tab3:
-    df_week = get_data(7)
-    if not df_week.empty:
-        fig3 = px.area(df_week, x='minute', y='count', color='event_type', title="Trend Settimanale")
-        st.plotly_chart(fig3, width='stretch')
+for tab_name, days in [("📊 Ultima Ora", 1/24), ("📈 24h", 1), ("📅 7 Giorni", 7)]:
+    with st.container():
+        df_tab = get_data(days)
+        if not df_tab.empty:
+            if tab_name == "📊 Ultima Ora":
+                fig = px.line(df_tab, x='minute', y='count', color='event_type', markers=True)
+            elif tab_name == "📈 24h":
+                fig = px.bar(df_tab, x='minute', y='count', color='event_type')
+            else:
+                fig = px.area(df_tab, x='minute', y='count', color='event_type')
+            st.plotly_chart(fig, width='stretch')
 
 
 st.subheader("🥇 Top Pagine (24h)")
-try:
-    df_pages = get_data(1)
-    if not df_pages.empty:
-        top_pages = df_pages[df_pages['event_type'] == 'page_view'].groupby('unique_pages')['count'].sum().nlargest(10)
-        if not top_pages.empty:
-            st.bar_chart(top_pages)
-        else:
-            st.info("📭 Nessuna page_view nelle 24h")
-    else:
-        st.info("📭 Dati non disponibili")
-except:
-    st.info("📭 Top pages non disponibile")
+df_pages = get_data(1)
+if not df_pages.empty:
+    top_pages = df_pages[df_pages['event_type'] == 'page_view'].groupby('unique_pages')['count'].sum().nlargest(10)
+    if not top_pages.empty:
+        st.bar_chart(top_pages)
+
 
