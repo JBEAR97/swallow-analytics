@@ -1,182 +1,457 @@
-# Swallow's Notes Analytics API - FIXED GEOIP per Railway
-# Usa X-Forwarded-For per IP reali
+from __future__ import annotations
 
-from fastapi import FastAPI, Request, HTTPException
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
-from datetime import datetime
 import os
-from dotenv import load_dotenv
+import re
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
+
 import geoip2.database
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
 from geoip2.errors import AddressNotFoundError
+from sqlalchemy import create_engine, text
 
 load_dotenv()
 
+TABLE_NAME = '"swallow-analysis"'
 BLOCKED_REF_SUBSTR = "https://orca-tetra-d4nz.squarespace.com"
+ALLOWED_EVENT_TYPES = {"page_view", "impression", "engagement", "heartbeat"}
+INTERNAL_TRAFFIC_SECRET = os.getenv("INTERNAL_TRAFFIC_SECRET", "").strip()
+BOT_PATTERNS = (
+    "bot",
+    "spider",
+    "crawler",
+    "crawl",
+    "slurp",
+    "facebookexternalhit",
+    "whatsapp",
+    "preview",
+    "headless",
+    "python-requests",
+    "curl/",
+    "wget/",
+    "uptime",
+    "monitor",
+    "pingdom",
+    "checkly",
+    "datadog",
+    "site24x7",
+)
+ID_PATTERN = re.compile(r"^[a-zA-Z0-9._:-]{1,128}$")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL mancante!")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-
 GEOIP_DB_PATH = os.path.join(os.path.dirname(__file__), "data", "GeoLite2-Country.mmdb")
+geoip_reader = None
 
-def run_migrations():
-    """Run database migrations on startup"""
+
+def column_exists(conn, column_name: str) -> bool:
+    result = conn.execute(
+        text(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_name = 'swallow-analysis'
+              AND column_name = :column_name
+            """
+        ),
+        {"column_name": column_name},
+    )
+    return result.fetchone() is not None
+
+
+def index_exists(conn, index_name: str) -> bool:
+    result = conn.execute(
+        text(
+            """
+            SELECT 1
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'swallow-analysis'
+              AND indexname = :index_name
+            """
+        ),
+        {"index_name": index_name},
+    )
+    return result.fetchone() is not None
+
+
+def add_column_if_missing(conn, column_name: str, ddl: str) -> None:
+    if not column_exists(conn, column_name):
+        conn.execute(text(f"ALTER TABLE {TABLE_NAME} ADD COLUMN {ddl}"))
+        print(f"✅ Migration: added {column_name}")
+
+
+def create_index_if_missing(conn, index_name: str, sql: str) -> None:
+    if not index_exists(conn, index_name):
+        conn.execute(text(sql))
+        print(f"✅ Migration: added index {index_name}")
+
+
+def run_migrations() -> None:
     try:
         with engine.begin() as conn:
-            # created_at migration
-            result = conn.execute(text("""
-                SELECT column_name FROM information_schema.columns 
-                WHERE table_name = 'swallow-analysis' AND column_name = 'created_at'
-            """))
-            if not result.fetchone():
-                conn.execute(text('ALTER TABLE "swallow-analysis" ADD COLUMN created_at TIMESTAMP DEFAULT NOW()'))
-                conn.execute(text('UPDATE "swallow-analysis" SET created_at = ts_utc'))
-                print("✅ Migration: added created_at")
-            
-            # country_code migration
-            result = conn.execute(text("""
-                SELECT column_name FROM information_schema.columns 
-                WHERE table_name = 'swallow-analysis' AND column_name = 'country_code'
-            """))
-            if not result.fetchone():
-                conn.execute(text('ALTER TABLE "swallow-analysis" ADD COLUMN country_code VARCHAR(2) DEFAULT \'ZZ\''))
-                print("✅ Migration: added country_code")
-                
-    except Exception as e:
-        print(f"⚠️ Migration warning: {e}")
+            conn.execute(
+                text(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+                        id BIGSERIAL PRIMARY KEY,
+                        event_type TEXT NOT NULL CHECK (event_type IN ('page_view', 'impression', 'engagement', 'heartbeat')),
+                        page_path TEXT NOT NULL,
+                        referrer TEXT,
+                        user_agent TEXT,
+                        ts_utc TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+            )
 
-geoip_reader = None
+            add_column_if_missing(conn, "created_at", "created_at TIMESTAMPTZ DEFAULT NOW()")
+            conn.execute(text(f"UPDATE {TABLE_NAME} SET created_at = ts_utc WHERE created_at IS NULL"))
+
+            add_column_if_missing(conn, "country_code", "country_code VARCHAR(2) DEFAULT 'ZZ'")
+            add_column_if_missing(conn, "event_id", "event_id VARCHAR(64)")
+            add_column_if_missing(conn, "visitor_id", "visitor_id VARCHAR(128)")
+            add_column_if_missing(conn, "session_id", "session_id VARCHAR(128)")
+            add_column_if_missing(conn, "page_load_id", "page_load_id VARCHAR(128)")
+            add_column_if_missing(conn, "item_id", "item_id VARCHAR(255)")
+            add_column_if_missing(conn, "item_type", "item_type VARCHAR(100)")
+            add_column_if_missing(conn, "item_label", "item_label TEXT")
+            add_column_if_missing(conn, "item_position", "item_position INTEGER")
+            add_column_if_missing(conn, "section", "section VARCHAR(100)")
+            add_column_if_missing(conn, "visibility_threshold", "visibility_threshold DOUBLE PRECISION")
+            add_column_if_missing(conn, "action_type", "action_type VARCHAR(100)")
+            add_column_if_missing(conn, "action_target", "action_target TEXT")
+            add_column_if_missing(conn, "action_value", "action_value TEXT")
+            add_column_if_missing(conn, "is_bot", "is_bot BOOLEAN DEFAULT FALSE")
+            add_column_if_missing(conn, "bot_reason", "bot_reason VARCHAR(255)")
+            add_column_if_missing(conn, "is_internal", "is_internal BOOLEAN DEFAULT FALSE")
+
+            create_index_if_missing(conn, "idx_swallow_ts_utc", f"CREATE INDEX idx_swallow_ts_utc ON {TABLE_NAME}(ts_utc)")
+            create_index_if_missing(conn, "idx_swallow_event_type", f"CREATE INDEX idx_swallow_event_type ON {TABLE_NAME}(event_type)")
+            create_index_if_missing(conn, "idx_swallow_event_id_unique", f"CREATE UNIQUE INDEX idx_swallow_event_id_unique ON {TABLE_NAME}(event_id)")
+            create_index_if_missing(conn, "idx_swallow_visitor_id", f"CREATE INDEX idx_swallow_visitor_id ON {TABLE_NAME}(visitor_id)")
+            create_index_if_missing(conn, "idx_swallow_session_id", f"CREATE INDEX idx_swallow_session_id ON {TABLE_NAME}(session_id)")
+            create_index_if_missing(conn, "idx_swallow_page_load_id", f"CREATE INDEX idx_swallow_page_load_id ON {TABLE_NAME}(page_load_id)")
+            create_index_if_missing(conn, "idx_swallow_item_id", f"CREATE INDEX idx_swallow_item_id ON {TABLE_NAME}(item_id)")
+            create_index_if_missing(conn, "idx_swallow_event_ts", f"CREATE INDEX idx_swallow_event_ts ON {TABLE_NAME}(event_type, ts_utc)")
+            create_index_if_missing(conn, "idx_swallow_page_event_ts", f"CREATE INDEX idx_swallow_page_event_ts ON {TABLE_NAME}(page_path, event_type, ts_utc)")
+            create_index_if_missing(
+                conn,
+                "idx_swallow_human_ts",
+                f"CREATE INDEX idx_swallow_human_ts ON {TABLE_NAME}(ts_utc) WHERE COALESCE(is_bot, FALSE) = FALSE AND COALESCE(is_internal, FALSE) = FALSE",
+            )
+    except Exception as exc:
+        print(f"⚠️ Migration warning: {exc}")
+
+
+def get_client_ip(request: Request) -> str:
+    client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "")
+    return client_ip.split(",")[0].strip() if client_ip else ""
+
+
+def get_country_code(client_ip: str) -> str:
+    if not geoip_reader or not client_ip:
+        return "ZZ"
+
+    try:
+        response = geoip_reader.country(client_ip)
+        country_code = response.country.iso_code or "ZZ"
+        print(f"🌍 {client_ip} → {country_code}")
+        return country_code
+    except AddressNotFoundError:
+        return "ZZ"
+    except Exception as exc:
+        print(f"⚠️ GeoIP {client_ip}: {exc}")
+        return "ZZ"
+
+
+def parse_timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def clip(value: object, limit: int) -> str | None:
+    if value is None:
+        return None
+    text_value = str(value).strip()
+    return text_value[:limit] if text_value else None
+
+
+def parse_int(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    return int(value)
+
+
+def parse_float(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    return float(value)
+
+
+def normalize_identifier(value: object, field_name: str, *, limit: int = 128) -> str | None:
+    value = clip(value, limit)
+    if value is None:
+        return None
+    if not ID_PATTERN.fullmatch(value):
+        raise HTTPException(422, f"❌ {field_name} contiene caratteri non validi")
+    return value
+
+
+def detect_bot(user_agent: str, referrer: str) -> tuple[bool, str | None]:
+    user_agent_lower = user_agent.lower()
+    referrer_lower = referrer.lower()
+
+    for pattern in BOT_PATTERNS:
+        if pattern in user_agent_lower:
+            return True, f"user_agent:{pattern}"
+
+    if "developers.google.com" in referrer_lower:
+        return True, "referrer:google_preview"
+
+    return False, None
+
+
+def detect_internal(request: Request, payload: dict) -> bool:
+    if bool(payload.get("internal")):
+        return True
+
+    if not INTERNAL_TRAFFIC_SECRET:
+        return False
+
+    provided_secret = (
+        request.headers.get("x-analytics-secret")
+        or request.query_params.get("analytics_secret")
+        or str(payload.get("internal_secret") or "").strip()
+    )
+    return provided_secret == INTERNAL_TRAFFIC_SECRET
+
+
+def validate_event_payload(data: dict) -> dict:
+    event_type = clip(data.get("event_type"), 32)
+    if event_type not in ALLOWED_EVENT_TYPES:
+        raise HTTPException(400, "❌ event_type non valido")
+
+    page_path = clip(data.get("page_path"), 500)
+    if not page_path:
+        raise HTTPException(400, "❌ page_path obbligatorio")
+
+    ts_raw = clip(data.get("ts_utc"), 64)
+    if not ts_raw:
+        raise HTTPException(400, "❌ ts_utc obbligatorio")
+
+    normalized = {
+        "event_type": event_type,
+        "page_path": page_path,
+        "referrer": clip(data.get("referrer"), 500) or "",
+        "ts_utc": parse_timestamp(ts_raw),
+        "event_id": normalize_identifier(data.get("event_id"), "event_id", limit=64) or str(uuid.uuid4()),
+        "visitor_id": normalize_identifier(data.get("visitor_id"), "visitor_id"),
+        "session_id": normalize_identifier(data.get("session_id"), "session_id"),
+        "page_load_id": normalize_identifier(data.get("page_load_id"), "page_load_id"),
+        "item_id": clip(data.get("item_id"), 255),
+        "item_type": clip(data.get("item_type"), 100),
+        "item_label": clip(data.get("item_label"), 500),
+        "item_position": parse_int(data.get("item_position")),
+        "section": clip(data.get("section"), 100),
+        "visibility_threshold": parse_float(data.get("visibility_threshold")),
+        "action_type": clip(data.get("action_type"), 100),
+        "action_target": clip(data.get("action_target"), 500),
+        "action_value": clip(data.get("action_value"), 500),
+    }
+
+    if event_type == "impression" and not normalized["item_id"]:
+        raise HTTPException(400, "❌ item_id obbligatorio per impression")
+
+    if event_type == "engagement" and not normalized["action_type"]:
+        raise HTTPException(400, "❌ action_type obbligatorio per engagement")
+
+    return normalized
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global geoip_reader
     run_migrations()
-    
-    # GeoIP startup
+
     try:
         geoip_reader = geoip2.database.Reader(GEOIP_DB_PATH)
         print(f"✅ GeoIP: {GEOIP_DB_PATH}")
-    except Exception as e:
-        print(f"❌ GeoIP init error: {e}")
-    
+    except Exception as exc:
+        print(f"❌ GeoIP init error: {exc}")
+
     yield
-    
+
     if geoip_reader:
         geoip_reader.close()
 
+
 app = FastAPI(title="Swallow Analytics + GeoIP", lifespan=lifespan)
+
 
 @app.get("/")
 async def health_check():
     return {
-        "status": "🟢 OK", 
+        "status": "🟢 OK",
         "endpoint": "/track (POST)",
+        "event_types": sorted(ALLOWED_EVENT_TYPES),
         "geoip": "✅" if geoip_reader else "❌",
-        "db_url": DATABASE_URL.split('@')[1].split('/')[0] if '@' in DATABASE_URL else "hidden"
+        "db_url": DATABASE_URL.split("@")[1].split("/")[0] if "@" in DATABASE_URL else "hidden",
     }
+
 
 @app.get("/test-geoip")
 async def test_geoip(request: Request):
-    """Test GeoIP reale (usa X-Forwarded-For)"""
-    global geoip_reader
     if not geoip_reader:
         return {"error": "GeoIP non inizializzato"}
-    
-    # FIXED: X-Forwarded-For per Railway proxy
-    client_ip = request.headers.get("x-forwarded-for", request.client.host)
-    if client_ip:
-        client_ip = client_ip.split(",")[0].strip()
-    
+
+    client_ip = get_client_ip(request)
     try:
         response = geoip_reader.country(client_ip)
         return {
             "client_ip": client_ip,
             "country_code": response.country.iso_code or "ZZ",
-            "country_name": response.country.name or "Unknown"
+            "country_name": response.country.name or "Unknown",
         }
     except AddressNotFoundError:
         return {"error": "IP non trovato nel DB", "ip": client_ip}
-    except Exception as e:
-        return {"error": str(e), "ip": client_ip}
+    except Exception as exc:
+        return {"error": str(exc), "ip": client_ip}
+
 
 @app.post("/track")
 async def track_event(request: Request):
-    """Track + COUNTRY reale da X-Forwarded-For"""
-    global geoip_reader
     try:
         data = await request.json()
-        
-        # Block squarespace preview
-        ref = (data.get("referrer") or "").lower()
-        if BLOCKED_REF_SUBSTR in ref:
+        if not isinstance(data, dict):
+            raise HTTPException(400, "❌ payload JSON non valido")
+
+        referrer = (data.get("referrer") or "").lower()
+        if BLOCKED_REF_SUBSTR in referrer:
             return {"status": "ignored", "reason": "squarespace_preview"}
-        
-        required = ["event_type", "page_path", "ts_utc"]
-        if any(not data.get(k) for k in required):
-            raise HTTPException(400, f"❌ Campi mancanti: {required}")
-        
-        if data["event_type"] not in ["page_view", "impression"]:
-            raise HTTPException(400, "❌ event_type: 'page_view' o 'impression'")
-        
-        # FIXED GEOIP: IP reale da proxy headers
-        country_code = "ZZ"
-        if geoip_reader:
-            client_ip = request.headers.get("x-forwarded-for", request.client.host)
-            if client_ip:
-                client_ip = client_ip.split(",")[0].strip()
-                try:
-                    response = geoip_reader.country(client_ip)
-                    country_code = response.country.iso_code or "ZZ"
-                    print(f"🌍 {client_ip} → {country_code}")  # Railway logs
-                except AddressNotFoundError:
-                    pass  # ZZ già settato
-                except Exception as ge:
-                    print(f"⚠️ GeoIP {client_ip}: {ge}")
-        
+
+        event = validate_event_payload(data)
+        client_ip = get_client_ip(request)
+        user_agent = clip(request.headers.get("user-agent"), 1000) or ""
+        country_code = get_country_code(client_ip)
+        is_bot, bot_reason = detect_bot(user_agent, event["referrer"])
+        is_internal = detect_internal(request, data)
+
         with engine.begin() as conn:
-            conn.execute(
-                text("""
-                    INSERT INTO "swallow-analysis" 
-                    (event_type, page_path, referrer, user_agent, ts_utc, country_code)
-                    VALUES (:event_type, :page_path, :referrer, :user_agent, :ts_utc, :country_code)
-                """),
+            result = conn.execute(
+                text(
+                    f"""
+                    INSERT INTO {TABLE_NAME} (
+                        event_type,
+                        page_path,
+                        referrer,
+                        user_agent,
+                        ts_utc,
+                        country_code,
+                        event_id,
+                        visitor_id,
+                        session_id,
+                        page_load_id,
+                        item_id,
+                        item_type,
+                        item_label,
+                        item_position,
+                        section,
+                        visibility_threshold,
+                        action_type,
+                        action_target,
+                        action_value,
+                        is_bot,
+                        bot_reason,
+                        is_internal
+                    )
+                    VALUES (
+                        :event_type,
+                        :page_path,
+                        :referrer,
+                        :user_agent,
+                        :ts_utc,
+                        :country_code,
+                        :event_id,
+                        :visitor_id,
+                        :session_id,
+                        :page_load_id,
+                        :item_id,
+                        :item_type,
+                        :item_label,
+                        :item_position,
+                        :section,
+                        :visibility_threshold,
+                        :action_type,
+                        :action_target,
+                        :action_value,
+                        :is_bot,
+                        :bot_reason,
+                        :is_internal
+                    )
+                    ON CONFLICT (event_id) DO NOTHING
+                    """
+                ),
                 {
-                    "event_type": data["event_type"],
-                    "page_path": data["page_path"][:500],
-                    "referrer": data.get("referrer", "")[:500],
-                    "user_agent": request.headers.get("user-agent", "")[:1000],
-                    "ts_utc": datetime.fromisoformat(data["ts_utc"].replace("Z", "+00:00")),
-                    "country_code": country_code
-                }
+                    **event,
+                    "user_agent": user_agent,
+                    "country_code": country_code,
+                    "is_bot": is_bot,
+                    "bot_reason": bot_reason,
+                    "is_internal": is_internal,
+                },
             )
-        
-        return {"status": "✅ OK", "event": data["event_type"], "country": country_code}
-    
-    except ValueError as e:
-        raise HTTPException(422, f"❌ Data: {e}")
-    except Exception as e:
-        raise HTTPException(500, f"❌ Errore: {e}")
+
+        if result.rowcount == 0:
+            return {"status": "ignored", "reason": "duplicate_event", "event_id": event["event_id"]}
+
+        return {
+            "status": "✅ OK",
+            "event": event["event_type"],
+            "country": country_code,
+            "is_bot": is_bot,
+            "is_internal": is_internal,
+        }
+
+    except ValueError as exc:
+        raise HTTPException(422, f"❌ Payload non valido: {exc}") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"❌ Errore: {exc}") from exc
+
 
 @app.get("/stats/minute")
 async def stats_minute():
     try:
         with engine.begin() as conn:
-            result = conn.execute(text("""
-                SELECT date_trunc('minute', ts_utc::timestamp) AS minute,
-                       event_type, COUNT(*) AS count
-                FROM "swallow-analysis" 
-                WHERE ts_utc >= NOW() - INTERVAL '10 minutes'
-                GROUP BY 1,2 ORDER BY 1 DESC LIMIT 10
-            """))
+            result = conn.execute(
+                text(
+                    f"""
+                    SELECT date_trunc('minute', ts_utc::timestamptz) AS minute,
+                           event_type,
+                           COUNT(*) AS count
+                    FROM {TABLE_NAME}
+                    WHERE ts_utc >= NOW() - INTERVAL '10 minutes'
+                      AND COALESCE(is_bot, FALSE) = FALSE
+                      AND COALESCE(is_internal, FALSE) = FALSE
+                    GROUP BY 1, 2
+                    ORDER BY 1 DESC, 2 ASC
+                    LIMIT 40
+                    """
+                )
+            )
             return {"stats": [dict(row._mapping) for row in result]}
-    except Exception as e:
-        raise HTTPException(500, f"❌ Stats: {e}")
+    except Exception as exc:
+        raise HTTPException(500, f"❌ Stats: {exc}") from exc
+
 
 if __name__ == "__main__":
     import uvicorn
+
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
