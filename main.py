@@ -92,6 +92,50 @@ def create_index_if_missing(conn, index_name: str, sql: str) -> None:
         print(f"✅ Migration: added index {index_name}")
 
 
+def ensure_event_type_constraint(conn) -> None:
+    allowed_values = "'page_view', 'impression', 'engagement', 'heartbeat'"
+    desired_definition = f"CHECK ((event_type = ANY (ARRAY[{allowed_values}])))"
+    result = conn.execute(
+        text(
+            """
+            SELECT conname, pg_get_constraintdef(pg_constraint.oid) AS definition
+            FROM pg_constraint
+            JOIN pg_class ON pg_class.oid = pg_constraint.conrelid
+            WHERE pg_class.relname = 'swallow-analysis'
+              AND pg_constraint.contype = 'c'
+            """
+        )
+    )
+
+    has_desired_constraint = False
+    constraints_to_replace: list[str] = []
+    for row in result:
+        name = row._mapping["conname"]
+        definition = row._mapping["definition"]
+        if "event_type" not in definition:
+            continue
+        if all(event_name in definition for event_name in ("page_view", "impression", "engagement", "heartbeat")):
+            has_desired_constraint = True
+            continue
+        constraints_to_replace.append(name)
+
+    for constraint_name in constraints_to_replace:
+        conn.execute(text(f'ALTER TABLE {TABLE_NAME} DROP CONSTRAINT "{constraint_name}"'))
+        print(f"✅ Migration: dropped outdated constraint {constraint_name}")
+
+    if not has_desired_constraint:
+        conn.execute(
+            text(
+                f"""
+                ALTER TABLE {TABLE_NAME}
+                ADD CONSTRAINT chk_event_type
+                CHECK (event_type IN ({allowed_values}))
+                """
+            )
+        )
+        print("✅ Migration: added chk_event_type")
+
+
 def run_migrations() -> None:
     try:
         with engine.begin() as conn:
@@ -109,6 +153,7 @@ def run_migrations() -> None:
                     """
                 )
             )
+            ensure_event_type_constraint(conn)
 
             add_column_if_missing(conn, "created_at", "created_at TIMESTAMPTZ DEFAULT NOW()")
             conn.execute(text(f"UPDATE {TABLE_NAME} SET created_at = ts_utc WHERE created_at IS NULL"))
