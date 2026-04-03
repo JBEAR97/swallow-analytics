@@ -16,6 +16,7 @@ load_dotenv()
 
 TABLE_NAME = '"swallow-analysis"'
 BLOCKED_REF_SUBSTR = "https://orca-tetra-d4nz.squarespace.com"
+IGNORED_PAGE_PATHS = {"srcdoc"}
 ALLOWED_EVENT_TYPES = {"page_view", "impression", "engagement", "heartbeat"}
 INTERNAL_TRAFFIC_SECRET = os.getenv("INTERNAL_TRAFFIC_SECRET", "").strip()
 BOT_PATTERNS = (
@@ -318,6 +319,12 @@ def validate_event_payload(data: dict) -> dict:
     return normalized
 
 
+def should_ignore_page_path(page_path: str | None) -> bool:
+    if page_path is None:
+        return False
+    return page_path.strip().lower() in IGNORED_PAGE_PATHS
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global geoip_reader
@@ -378,6 +385,9 @@ async def track_event(request: Request):
         referrer = (data.get("referrer") or "").lower()
         if BLOCKED_REF_SUBSTR in referrer:
             return {"status": "ignored", "reason": "squarespace_preview"}
+
+        if should_ignore_page_path(data.get("page_path")):
+            return {"status": "ignored", "reason": "invalid_page_path"}
 
         event = validate_event_payload(data)
         client_ip = get_client_ip(request)
