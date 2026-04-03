@@ -15,6 +15,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 AUTO_REFRESH_SECONDS = 600
 METRIC_WINDOW_DAYS = 1
+MONTH_WINDOW_DAYS = 30
 ALL_TIME_DAYS_THRESHOLD = 10_000
 EVENT_TABLE = '"swallow-analysis"'
 TIME_FILTERS = {
@@ -332,22 +333,22 @@ def render_event_tabs(filter_sql: str) -> None:
 
 
 def render_top_pages(filter_sql: str) -> None:
-    st.subheader("🥇 Top Pagine (24h)")
-    df_pages = get_top_pages(METRIC_WINDOW_DAYS, filter_sql)
+    st.subheader("🥇 Top Pagine (30d)")
+    df_pages = get_top_pages(MONTH_WINDOW_DAYS, filter_sql)
 
     if df_pages.empty:
-        st.info("Nessuna page view registrata nelle ultime 24 ore.")
+        st.info("Nessuna page view registrata negli ultimi 30 giorni.")
         return
 
     st.dataframe(df_pages, width="stretch", hide_index=True)
 
 
 def render_top_items(filter_sql: str) -> None:
-    st.subheader("🧱 Top Items by Impression (24h)")
-    df_items = get_top_items(METRIC_WINDOW_DAYS, filter_sql)
+    st.subheader("🧱 Top Items by Impression (30d)")
+    df_items = get_top_items(MONTH_WINDOW_DAYS, filter_sql)
 
     if df_items.empty:
-        st.info("Nessuna impression item-level registrata nelle ultime 24 ore.")
+        st.info("Nessuna impression item-level registrata negli ultimi 30 giorni.")
         return
 
     fig = px.bar(
@@ -364,10 +365,10 @@ def render_top_items(filter_sql: str) -> None:
 
 
 def render_engagement_section(filter_sql: str) -> None:
-    st.subheader("🎯 Engagement Breakdown (24h)")
-    df_engagement = get_engagement_breakdown(METRIC_WINDOW_DAYS, filter_sql)
+    st.subheader("🎯 Engagement Breakdown (30d)")
+    df_engagement = get_engagement_breakdown(MONTH_WINDOW_DAYS, filter_sql)
     if df_engagement.empty:
-        st.info("Nessun evento di engagement registrato nelle ultime 24 ore.")
+        st.info("Nessun evento di engagement registrato negli ultimi 30 giorni.")
         return
 
     fig = px.pie(df_engagement, names="action_type", values="count", title="Engagement Types")
