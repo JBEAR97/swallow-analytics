@@ -249,6 +249,35 @@ def render_metric_cards(df: pd.DataFrame) -> None:
     with col8:
         st.metric("🧱 Tracked Items", int(row["tracked_items"]))
 
+    with st.expander("Metric legend", expanded=False):
+        st.markdown(
+            """
+            **👀 Page Views (24h)**  
+            Total number of `page_view` events recorded in the last 24 hours. A single visitor can generate multiple page views by reloading a page or visiting several pages.
+
+            **📖 Impressions (24h)**  
+            Total number of `impression` events recorded in the last 24 hours. These usually represent tracked elements or content blocks that were shown to a visitor.
+
+            **🙋 Unique Visitors**  
+            Number of distinct `visitor_id` values seen in the selected time window. This estimates how many individual visitors were tracked, excluding events without a visitor ID.
+
+            **🧭 Sessions**  
+            Number of distinct `session_id` values in the selected time window. A session groups events that belong to the same visit or browsing session.
+
+            **⚡ Engagements**  
+            Total number of `engagement` events recorded in the selected time window. These are active interactions such as clicks or other tracked user actions.
+
+            **💓 Heartbeats**  
+            Total number of `heartbeat` events recorded in the selected time window. Heartbeats usually indicate that a visitor remained active on a page over time.
+
+            **📄 Unique Pages**  
+            Number of distinct `page_path` values seen in the selected time window. This shows how many different pages generated tracked activity.
+
+            **🧱 Tracked Items**  
+            Number of distinct `item_id` values seen in the selected time window. This represents how many unique tracked elements, components, or content items appeared in the data.
+            """
+        )
+
 
 def render_country_section(filter_sql: str) -> None:
     st.subheader("🌍 GeoIP: Human Traffic by Country")
