@@ -34,6 +34,12 @@ QUALITY_FILTERS = {
     "Include internal": "COALESCE(is_bot, FALSE) = FALSE",
     "All traffic": "TRUE",
 }
+ACTION_TYPE_LABELS = {
+    "link_click": "Link Click",
+    "scroll_50": "Scrolled 50% of Page",
+    "scroll_90": "Scrolled 90% of Page",
+    "cta_click": "CTA Click",
+}
 
 
 def get_iso2_to_iso3() -> dict[str, str]:
@@ -44,6 +50,10 @@ def get_iso2_to_iso3() -> dict[str, str]:
 
 
 ISO2_TO_ISO3 = get_iso2_to_iso3()
+
+
+def humanize_action_type(action_type: str) -> str:
+    return ACTION_TYPE_LABELS.get(action_type, action_type.replace("_", " ").title())
 
 
 def build_database_url() -> str | None:
@@ -400,9 +410,16 @@ def render_engagement_section(filter_sql: str) -> None:
         st.info("Nessun evento di engagement registrato negli ultimi 30 giorni.")
         return
 
-    fig = px.pie(df_engagement, names="action_type", values="count", title="Engagement Types")
+    df_engagement = df_engagement.copy()
+    df_engagement["action_label"] = df_engagement["action_type"].map(humanize_action_type)
+
+    fig = px.pie(df_engagement, names="action_label", values="count", title="Engagement Types")
     st.plotly_chart(fig, width="stretch")
-    st.dataframe(df_engagement, width="stretch", hide_index=True)
+    st.dataframe(
+        df_engagement[["action_label", "count"]].rename(columns={"action_label": "action_type"}),
+        width="stretch",
+        hide_index=True,
+    )
 
 
 DATABASE_URL = build_database_url()
