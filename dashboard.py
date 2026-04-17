@@ -384,13 +384,21 @@ def render_overview(days: float, filter_sql: str) -> None:
     with st.expander("Metric definitions", expanded=False):
         st.markdown(
             """
-            `Users`: distinct `visitor_id` values in the selected period.
+            `Users`: distinct `visitor_id` values in the selected period. Events without a `visitor_id` do not increase this metric.
 
-            `Sessions`: distinct session identifiers, with a fallback derived from `visitor_id` and hour when a session id is missing.
+            `Sessions`: distinct `session_id` values in the selected period. If a session id is missing, the dashboard falls back to a synthetic session key based on `visitor_id` and hour.
 
-            `Engaged Sessions`: sessions with 2+ page views, or at least one engagement, heartbeat, or conversion.
+            `Engaged Sessions`: sessions with at least 2 page views, or at least 1 engagement event, heartbeat, or conversion.
 
-            `Session CVR`: conversions divided by sessions. A session can contain more than one conversion.
+            `Page Views`: total number of `page_view` events in the selected period.
+
+            `Engagement Rate`: engaged sessions divided by total sessions.
+
+            `Pages / Session`: total page views divided by total sessions.
+
+            `Conversions`: total number of events where `is_conversion = true`. A single session can contain multiple conversions.
+
+            `Session CVR`: conversions divided by sessions. Because sessions can contain more than one conversion, this is a session-normalized conversion rate, not a unique-session conversion rate.
             """
         )
 
