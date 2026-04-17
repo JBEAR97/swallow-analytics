@@ -3,8 +3,9 @@ from __future__ import annotations
 import os
 import re
 import uuid
+import urllib.parse
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import geoip2.database
 from dotenv import load_dotenv
@@ -19,6 +20,7 @@ BLOCKED_REF_SUBSTR = "https://orca-tetra-d4nz.squarespace.com"
 IGNORED_PAGE_PATHS = {"srcdoc"}
 ALLOWED_EVENT_TYPES = {"page_view", "impression", "engagement", "heartbeat"}
 INTERNAL_TRAFFIC_SECRET = os.getenv("INTERNAL_TRAFFIC_SECRET", "").strip()
+MAX_CLIENT_TS_SKEW = timedelta(days=7)
 BOT_PATTERNS = (
     "bot",
     "spider",
@@ -173,6 +175,24 @@ def run_migrations() -> None:
             add_column_if_missing(conn, "action_type", "action_type VARCHAR(100)")
             add_column_if_missing(conn, "action_target", "action_target TEXT")
             add_column_if_missing(conn, "action_value", "action_value TEXT")
+            add_column_if_missing(conn, "client_ts_utc", "client_ts_utc TIMESTAMPTZ")
+            add_column_if_missing(conn, "page_url", "page_url TEXT")
+            add_column_if_missing(conn, "page_title", "page_title VARCHAR(300)")
+            add_column_if_missing(conn, "hostname", "hostname VARCHAR(255)")
+            add_column_if_missing(conn, "utm_source", "utm_source VARCHAR(150)")
+            add_column_if_missing(conn, "utm_medium", "utm_medium VARCHAR(150)")
+            add_column_if_missing(conn, "utm_campaign", "utm_campaign VARCHAR(150)")
+            add_column_if_missing(conn, "utm_term", "utm_term VARCHAR(150)")
+            add_column_if_missing(conn, "utm_content", "utm_content VARCHAR(150)")
+            add_column_if_missing(conn, "source", "source VARCHAR(150)")
+            add_column_if_missing(conn, "medium", "medium VARCHAR(150)")
+            add_column_if_missing(conn, "campaign", "campaign VARCHAR(150)")
+            add_column_if_missing(conn, "device_category", "device_category VARCHAR(32)")
+            add_column_if_missing(conn, "browser", "browser VARCHAR(64)")
+            add_column_if_missing(conn, "operating_system", "operating_system VARCHAR(64)")
+            add_column_if_missing(conn, "is_conversion", "is_conversion BOOLEAN DEFAULT FALSE")
+            add_column_if_missing(conn, "conversion_name", "conversion_name VARCHAR(150)")
+            add_column_if_missing(conn, "event_value", "event_value DOUBLE PRECISION")
             add_column_if_missing(conn, "is_bot", "is_bot BOOLEAN DEFAULT FALSE")
             add_column_if_missing(conn, "bot_reason", "bot_reason VARCHAR(255)")
             add_column_if_missing(conn, "is_internal", "is_internal BOOLEAN DEFAULT FALSE")
@@ -186,6 +206,9 @@ def run_migrations() -> None:
             create_index_if_missing(conn, "idx_swallow_item_id", f"CREATE INDEX idx_swallow_item_id ON {TABLE_NAME}(item_id)")
             create_index_if_missing(conn, "idx_swallow_event_ts", f"CREATE INDEX idx_swallow_event_ts ON {TABLE_NAME}(event_type, ts_utc)")
             create_index_if_missing(conn, "idx_swallow_page_event_ts", f"CREATE INDEX idx_swallow_page_event_ts ON {TABLE_NAME}(page_path, event_type, ts_utc)")
+            create_index_if_missing(conn, "idx_swallow_session_ts", f"CREATE INDEX idx_swallow_session_ts ON {TABLE_NAME}(session_id, ts_utc)")
+            create_index_if_missing(conn, "idx_swallow_source_medium_ts", f"CREATE INDEX idx_swallow_source_medium_ts ON {TABLE_NAME}(source, medium, ts_utc)")
+            create_index_if_missing(conn, "idx_swallow_conversion_ts", f"CREATE INDEX idx_swallow_conversion_ts ON {TABLE_NAME}(is_conversion, ts_utc)")
             create_index_if_missing(
                 conn,
                 "idx_swallow_human_ts",
@@ -217,7 +240,10 @@ def get_country_code(client_ip: str) -> str:
 
 
 def parse_timestamp(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def clip(value: object, limit: int) -> str | None:
@@ -237,6 +263,14 @@ def parse_float(value: object) -> float | None:
     if value in (None, ""):
         return None
     return float(value)
+
+
+def parse_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def normalize_identifier(value: object, field_name: str, *, limit: int = 128) -> str | None:
@@ -277,24 +311,153 @@ def detect_internal(request: Request, payload: dict) -> bool:
     return provided_secret == INTERNAL_TRAFFIC_SECRET
 
 
+def sanitize_page_path(page_path: str | None, page_url: str | None = None) -> str | None:
+    candidate = clip(page_path, 500)
+    if candidate:
+        if candidate.startswith(("http://", "https://")):
+            parsed = urllib.parse.urlparse(candidate)
+            candidate = parsed.path or "/"
+        return candidate if candidate.startswith("/") else f"/{candidate.lstrip('/')}"
+
+    if not page_url:
+        return None
+
+    parsed = urllib.parse.urlparse(page_url)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return parsed.path or "/"
+
+
+def normalize_page_url(value: object) -> str | None:
+    page_url = clip(value, 1000)
+    if not page_url:
+        return None
+    parsed = urllib.parse.urlparse(page_url)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    return parsed.geturl()
+
+
+def get_hostname(page_url: str | None, fallback: object = None) -> str | None:
+    if page_url:
+        parsed = urllib.parse.urlparse(page_url)
+        if parsed.hostname:
+            return clip(parsed.hostname, 255)
+    return clip(fallback, 255)
+
+
+def choose_event_timestamp(ts_raw: str | None) -> tuple[datetime, datetime | None]:
+    server_now = datetime.now(timezone.utc)
+    if not ts_raw:
+        return server_now, None
+
+    client_ts = parse_timestamp(ts_raw)
+    if abs(server_now - client_ts) > MAX_CLIENT_TS_SKEW:
+        return server_now, client_ts
+    return client_ts, client_ts
+
+
+def classify_referrer(referrer: str) -> tuple[str, str]:
+    if not referrer:
+        return "direct", "(none)"
+
+    parsed = urllib.parse.urlparse(referrer)
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        return "direct", "(none)"
+
+    if any(token in hostname for token in ("google.", "bing.", "duckduckgo.", "search.yahoo.")):
+        return hostname, "organic"
+    if any(
+        token in hostname
+        for token in (
+            "facebook.com",
+            "m.facebook.com",
+            "instagram.com",
+            "l.instagram.com",
+            "twitter.com",
+            "x.com",
+            "t.co",
+            "linkedin.com",
+            "lnkd.in",
+            "pinterest.",
+            "reddit.com",
+            "youtube.com",
+        )
+    ):
+        return hostname, "social"
+    return hostname, "referral"
+
+
+def derive_acquisition(event: dict) -> tuple[str, str, str | None]:
+    utm_source = clip(event.get("utm_source"), 150)
+    utm_medium = clip(event.get("utm_medium"), 150)
+    utm_campaign = clip(event.get("utm_campaign"), 150)
+    if utm_source or utm_medium or utm_campaign:
+        return utm_source or "direct", utm_medium or "(not set)", utm_campaign
+
+    source, medium = classify_referrer(event.get("referrer", ""))
+    return source, medium, None
+
+
+def detect_device_context(user_agent: str) -> tuple[str, str, str]:
+    ua = user_agent.lower()
+
+    if any(token in ua for token in ("ipad", "tablet")):
+        device_category = "tablet"
+    elif any(token in ua for token in ("mobile", "iphone", "android")):
+        device_category = "mobile"
+    else:
+        device_category = "desktop"
+
+    if "edg/" in ua:
+        browser = "Edge"
+    elif "opr/" in ua or "opera" in ua:
+        browser = "Opera"
+    elif "chrome/" in ua and "edg/" not in ua:
+        browser = "Chrome"
+    elif "firefox/" in ua:
+        browser = "Firefox"
+    elif "safari/" in ua and "chrome/" not in ua:
+        browser = "Safari"
+    else:
+        browser = "Other"
+
+    if "windows" in ua:
+        operating_system = "Windows"
+    elif "iphone" in ua or "ipad" in ua or "ios" in ua:
+        operating_system = "iOS"
+    elif "android" in ua:
+        operating_system = "Android"
+    elif "mac os x" in ua or "macintosh" in ua:
+        operating_system = "macOS"
+    elif "linux" in ua:
+        operating_system = "Linux"
+    else:
+        operating_system = "Other"
+
+    return device_category, browser, operating_system
+
+
 def validate_event_payload(data: dict) -> dict:
     event_type = clip(data.get("event_type"), 32)
     if event_type not in ALLOWED_EVENT_TYPES:
         raise HTTPException(400, "❌ event_type non valido")
 
-    page_path = clip(data.get("page_path"), 500)
+    page_url = normalize_page_url(data.get("page_url"))
+    page_path = sanitize_page_path(data.get("page_path"), page_url)
     if not page_path:
         raise HTTPException(400, "❌ page_path obbligatorio")
 
     ts_raw = clip(data.get("ts_utc"), 64)
-    if not ts_raw:
-        raise HTTPException(400, "❌ ts_utc obbligatorio")
+    ts_utc, client_ts_utc = choose_event_timestamp(ts_raw)
 
     normalized = {
         "event_type": event_type,
         "page_path": page_path,
         "referrer": clip(data.get("referrer"), 500) or "",
-        "ts_utc": parse_timestamp(ts_raw),
+        "ts_utc": ts_utc,
+        "client_ts_utc": client_ts_utc,
         "event_id": normalize_identifier(data.get("event_id"), "event_id", limit=64) or str(uuid.uuid4()),
         "visitor_id": normalize_identifier(data.get("visitor_id"), "visitor_id"),
         "session_id": normalize_identifier(data.get("session_id"), "session_id"),
@@ -308,6 +471,17 @@ def validate_event_payload(data: dict) -> dict:
         "action_type": clip(data.get("action_type"), 100),
         "action_target": clip(data.get("action_target"), 500),
         "action_value": clip(data.get("action_value"), 500),
+        "page_url": page_url,
+        "page_title": clip(data.get("page_title"), 300),
+        "hostname": get_hostname(page_url, data.get("hostname")),
+        "utm_source": clip(data.get("utm_source"), 150),
+        "utm_medium": clip(data.get("utm_medium"), 150),
+        "utm_campaign": clip(data.get("utm_campaign"), 150),
+        "utm_term": clip(data.get("utm_term"), 150),
+        "utm_content": clip(data.get("utm_content"), 150),
+        "is_conversion": parse_bool(data.get("is_conversion")),
+        "conversion_name": clip(data.get("conversion_name"), 150),
+        "event_value": parse_float(data.get("event_value")),
     }
 
     if event_type == "impression" and not normalized["item_id"]:
@@ -315,6 +489,9 @@ def validate_event_payload(data: dict) -> dict:
 
     if event_type == "engagement" and not normalized["action_type"]:
         raise HTTPException(400, "❌ action_type obbligatorio per engagement")
+
+    if normalized["is_conversion"] and not normalized["conversion_name"]:
+        normalized["conversion_name"] = normalized["action_type"] or normalized["event_type"]
 
     return normalized
 
@@ -395,6 +572,8 @@ async def track_event(request: Request):
         country_code = get_country_code(client_ip)
         is_bot, bot_reason = detect_bot(user_agent, event["referrer"])
         is_internal = detect_internal(request, data)
+        source, medium, campaign = derive_acquisition(event)
+        device_category, browser, operating_system = detect_device_context(user_agent)
 
         with engine.begin() as conn:
             result = conn.execute(
@@ -406,6 +585,7 @@ async def track_event(request: Request):
                         referrer,
                         user_agent,
                         ts_utc,
+                        client_ts_utc,
                         country_code,
                         event_id,
                         visitor_id,
@@ -420,6 +600,23 @@ async def track_event(request: Request):
                         action_type,
                         action_target,
                         action_value,
+                        page_url,
+                        page_title,
+                        hostname,
+                        utm_source,
+                        utm_medium,
+                        utm_campaign,
+                        utm_term,
+                        utm_content,
+                        source,
+                        medium,
+                        campaign,
+                        device_category,
+                        browser,
+                        operating_system,
+                        is_conversion,
+                        conversion_name,
+                        event_value,
                         is_bot,
                         bot_reason,
                         is_internal
@@ -430,6 +627,7 @@ async def track_event(request: Request):
                         :referrer,
                         :user_agent,
                         :ts_utc,
+                        :client_ts_utc,
                         :country_code,
                         :event_id,
                         :visitor_id,
@@ -444,6 +642,23 @@ async def track_event(request: Request):
                         :action_type,
                         :action_target,
                         :action_value,
+                        :page_url,
+                        :page_title,
+                        :hostname,
+                        :utm_source,
+                        :utm_medium,
+                        :utm_campaign,
+                        :utm_term,
+                        :utm_content,
+                        :source,
+                        :medium,
+                        :campaign,
+                        :device_category,
+                        :browser,
+                        :operating_system,
+                        :is_conversion,
+                        :conversion_name,
+                        :event_value,
                         :is_bot,
                         :bot_reason,
                         :is_internal
@@ -455,6 +670,12 @@ async def track_event(request: Request):
                     **event,
                     "user_agent": user_agent,
                     "country_code": country_code,
+                    "source": source,
+                    "medium": medium,
+                    "campaign": campaign,
+                    "device_category": device_category,
+                    "browser": browser,
+                    "operating_system": operating_system,
                     "is_bot": is_bot,
                     "bot_reason": bot_reason,
                     "is_internal": is_internal,
@@ -468,6 +689,8 @@ async def track_event(request: Request):
             "status": "✅ OK",
             "event": event["event_type"],
             "country": country_code,
+            "source": source,
+            "medium": medium,
             "is_bot": is_bot,
             "is_internal": is_internal,
         }
