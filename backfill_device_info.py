@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import os
 
-from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # Railway runtime may not include python-dotenv
+    load_dotenv = None
 
 
 TABLE_NAME = '"swallow-analysis"'
@@ -69,7 +73,8 @@ def fetch_batch(conn) -> list[dict]:
 
 
 def main() -> None:
-    load_dotenv()
+    if load_dotenv is not None:
+        load_dotenv()
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL is required")
