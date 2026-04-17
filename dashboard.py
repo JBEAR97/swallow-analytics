@@ -396,7 +396,7 @@ def render_overview(days: float, filter_sql: str) -> None:
 
             `Pages / Session`: total page views divided by total sessions.
 
-            `Conversions`: total number of events where `is_conversion = true`. A single session can contain multiple conversions.
+            `Conversions`: total number of events where `is_conversion = true`. This includes both newly tracked explicit conversions and any historical rows you intentionally backfilled. A single session can contain multiple conversions.
 
             `Session CVR`: conversions divided by sessions. Because sessions can contain more than one conversion, this is a session-normalized conversion rate, not a unique-session conversion rate.
             """
