@@ -20,9 +20,12 @@ DEFAULT_ITEM_IDS: tuple[str, ...] = ()
 
 
 def parse_csv_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
-    raw = os.getenv(name, "").strip()
-    if not raw:
+    raw = os.getenv(name)
+    if raw is None:
         return default
+    raw = raw.strip()
+    if not raw:
+        return ()
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
