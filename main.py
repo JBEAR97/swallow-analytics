@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import uuid
 import urllib.parse
 from contextlib import asynccontextmanager
@@ -20,6 +21,8 @@ BLOCKED_REF_SUBSTR = "https://orca-tetra-d4nz.squarespace.com"
 IGNORED_PAGE_PATHS = {"srcdoc"}
 ALLOWED_EVENT_TYPES = {"page_view", "impression", "engagement", "heartbeat"}
 INTERNAL_TRAFFIC_SECRET = os.getenv("INTERNAL_TRAFFIC_SECRET", "").strip()
+ANALYTICS_ADMIN_TOKEN = os.getenv("ANALYTICS_ADMIN_TOKEN", "").strip()
+GEOIP_DEBUG_LOGS = os.getenv("GEOIP_DEBUG_LOGS", "").strip().lower() in {"1", "true", "yes", "on"}
 MAX_CLIENT_TS_SKEW = timedelta(days=7)
 BOT_PATTERNS = (
     "bot",
@@ -42,6 +45,7 @@ BOT_PATTERNS = (
     "site24x7",
 )
 ID_PATTERN = re.compile(r"^[a-zA-Z0-9._:-]{1,128}$")
+DEFAULT_RETENTION_DAYS = 180
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -50,6 +54,24 @@ if not DATABASE_URL:
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 GEOIP_DB_PATH = os.path.join(os.path.dirname(__file__), "data", "GeoLite2-Country.mmdb")
 geoip_reader = None
+
+
+def parse_positive_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        print(f"⚠️ {name} must be an integer; using {default}")
+        return default
+    if parsed <= 0:
+        print(f"⚠️ {name} must be positive; using {default}")
+        return default
+    return parsed
+
+
+ANALYTICS_RETENTION_DAYS = parse_positive_int_env("ANALYTICS_RETENTION_DAYS", DEFAULT_RETENTION_DAYS)
 
 
 def column_exists(conn, column_name: str) -> bool:
@@ -93,6 +115,22 @@ def create_index_if_missing(conn, index_name: str, sql: str) -> None:
     if not index_exists(conn, index_name):
         conn.execute(text(sql))
         print(f"✅ Migration: added index {index_name}")
+
+
+def prune_expired_events(conn) -> int:
+    result = conn.execute(
+        text(
+            f"""
+            DELETE FROM {TABLE_NAME}
+            WHERE ts_utc < NOW() - INTERVAL '1 day' * :retention_days
+            """
+        ),
+        {"retention_days": ANALYTICS_RETENTION_DAYS},
+    )
+    deleted_count = result.rowcount or 0
+    if deleted_count:
+        print(f"✅ Retention: deleted {deleted_count} events older than {ANALYTICS_RETENTION_DAYS} days")
+    return deleted_count
 
 
 def ensure_event_type_constraint(conn) -> None:
@@ -214,6 +252,7 @@ def run_migrations() -> None:
                 "idx_swallow_human_ts",
                 f"CREATE INDEX idx_swallow_human_ts ON {TABLE_NAME}(ts_utc) WHERE COALESCE(is_bot, FALSE) = FALSE AND COALESCE(is_internal, FALSE) = FALSE",
             )
+            prune_expired_events(conn)
     except Exception as exc:
         print(f"⚠️ Migration warning: {exc}")
 
@@ -230,7 +269,8 @@ def get_country_code(client_ip: str) -> str:
     try:
         response = geoip_reader.country(client_ip)
         country_code = response.country.iso_code or "ZZ"
-        print(f"🌍 {client_ip} → {country_code}")
+        if GEOIP_DEBUG_LOGS:
+            print(f"🌍 GeoIP lookup succeeded for {country_code}")
         return country_code
     except AddressNotFoundError:
         return "ZZ"
@@ -309,6 +349,17 @@ def detect_internal(request: Request, payload: dict) -> bool:
         or str(payload.get("internal_secret") or "").strip()
     )
     return provided_secret == INTERNAL_TRAFFIC_SECRET
+
+
+def require_admin_token(request: Request) -> None:
+    if not ANALYTICS_ADMIN_TOKEN:
+        raise HTTPException(403, "Admin endpoint disabled: set ANALYTICS_ADMIN_TOKEN")
+
+    auth_header = request.headers.get("authorization", "").strip()
+    bearer_token = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
+    provided_token = request.headers.get("x-analytics-admin-token", "").strip() or bearer_token
+    if not secrets.compare_digest(provided_token, ANALYTICS_ADMIN_TOKEN):
+        raise HTTPException(403, "Admin token required")
 
 
 def sanitize_page_path(page_path: str | None, page_url: str | None = None) -> str | None:
@@ -535,6 +586,7 @@ async def health_check():
 
 @app.get("/test-geoip")
 async def test_geoip(request: Request):
+    require_admin_token(request)
     if not geoip_reader:
         return {"error": "GeoIP non inizializzato"}
 
@@ -542,14 +594,14 @@ async def test_geoip(request: Request):
     try:
         response = geoip_reader.country(client_ip)
         return {
-            "client_ip": client_ip,
+            "client_ip_present": bool(client_ip),
             "country_code": response.country.iso_code or "ZZ",
             "country_name": response.country.name or "Unknown",
         }
     except AddressNotFoundError:
-        return {"error": "IP non trovato nel DB", "ip": client_ip}
+        return {"error": "IP non trovato nel DB", "client_ip_present": bool(client_ip)}
     except Exception as exc:
-        return {"error": str(exc), "ip": client_ip}
+        return {"error": str(exc), "client_ip_present": bool(client_ip)}
 
 
 @app.post("/track")
@@ -704,7 +756,8 @@ async def track_event(request: Request):
 
 
 @app.get("/stats/minute")
-async def stats_minute():
+async def stats_minute(request: Request):
+    require_admin_token(request)
     try:
         with engine.begin() as conn:
             result = conn.execute(

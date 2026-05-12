@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import time
 import urllib.parse
 from datetime import datetime
@@ -16,6 +17,7 @@ from sqlalchemy.exc import SQLAlchemyError
 AUTO_REFRESH_SECONDS = 600
 ALL_TIME_DAYS_THRESHOLD = 10_000
 EVENT_TABLE = '"swallow-analysis"'
+DEFAULT_RETENTION_DAYS = 180
 SESSION_KEY_SQL = """
 COALESCE(
     NULLIF(session_id, ''),
@@ -37,6 +39,24 @@ QUALITY_FILTERS = {
     "Include internal": "COALESCE(is_bot, FALSE) = FALSE",
     "All traffic": "TRUE",
 }
+
+
+def parse_positive_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+ANALYTICS_RETENTION_DAYS = parse_positive_int_env("ANALYTICS_RETENTION_DAYS", DEFAULT_RETENTION_DAYS)
+IUBENDA_PRIVACY_URL = os.getenv("IUBENDA_PRIVACY_URL", "").strip()
+IUBENDA_COOKIE_POLICY_URL = os.getenv("IUBENDA_COOKIE_POLICY_URL", "").strip()
+ANALYTICS_ADMIN_TOKEN_CONFIGURED = bool(os.getenv("ANALYTICS_ADMIN_TOKEN", "").strip())
+DASHBOARD_ADMIN_PASSWORD = os.getenv("DASHBOARD_ADMIN_PASSWORD", "").strip()
 
 
 def get_iso2_to_iso3() -> dict[str, str]:
@@ -75,6 +95,27 @@ def run_query(query: str, params: dict | None = None, *, parse_dates: list[str] 
             time.sleep(1)
 
     return pd.DataFrame()
+
+
+def require_dashboard_auth() -> None:
+    if not DASHBOARD_ADMIN_PASSWORD:
+        st.error("Dashboard locked: set DASHBOARD_ADMIN_PASSWORD.")
+        st.stop()
+
+    if st.session_state.get("dashboard_authenticated"):
+        return
+
+    with st.form("dashboard_login"):
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Log in")
+
+    if submitted and secrets.compare_digest(password, DASHBOARD_ADMIN_PASSWORD):
+        st.session_state.dashboard_authenticated = True
+        st.rerun()
+    if submitted:
+        st.error("Invalid password.")
+
+    st.stop()
 
 
 def traffic_clause() -> str:
@@ -344,6 +385,84 @@ def get_country_counts(days: float, filter_sql: str) -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=AUTO_REFRESH_SECONDS)
+def get_privacy_metrics() -> pd.DataFrame:
+    return run_query(
+        f"""
+        SELECT
+            COUNT(*) AS total_events,
+            MIN(ts_utc) AS oldest_event,
+            MAX(ts_utc) AS newest_event,
+            COUNT(*) FILTER (
+                WHERE ts_utc < NOW() - INTERVAL '1 day' * :retention_days
+            ) AS events_past_retention,
+            COUNT(DISTINCT visitor_id) FILTER (WHERE visitor_id IS NOT NULL) AS distinct_visitors,
+            COUNT(DISTINCT session_id) FILTER (WHERE session_id IS NOT NULL) AS distinct_sessions,
+            COUNT(*) FILTER (WHERE COALESCE(page_url, '') <> '') AS rows_with_page_url,
+            COUNT(*) FILTER (WHERE COALESCE(referrer, '') <> '') AS rows_with_referrer,
+            COUNT(*) FILTER (WHERE COALESCE(user_agent, '') <> '') AS rows_with_user_agent,
+            COUNT(*) FILTER (WHERE COALESCE(is_conversion, FALSE)) AS conversion_events,
+            COUNT(*) FILTER (WHERE COALESCE(is_internal, FALSE)) AS internal_events
+        FROM {EVENT_TABLE}
+        """,
+        params={"retention_days": ANALYTICS_RETENTION_DAYS},
+        parse_dates=["oldest_event", "newest_event"],
+    )
+
+
+def fetch_subject_events(identifier_type: str, identifier_value: str) -> pd.DataFrame:
+    if identifier_type not in {"visitor_id", "session_id"}:
+        return pd.DataFrame()
+    return run_query(
+        f"""
+        SELECT
+            id,
+            ts_utc,
+            event_type,
+            page_path,
+            country_code,
+            source,
+            medium,
+            campaign,
+            device_category,
+            browser,
+            operating_system,
+            is_conversion,
+            conversion_name,
+            action_type,
+            action_target,
+            item_id,
+            item_type
+        FROM {EVENT_TABLE}
+        WHERE {identifier_type} = :identifier_value
+        ORDER BY ts_utc DESC, id DESC
+        LIMIT 5000
+        """,
+        params={"identifier_value": identifier_value},
+        parse_dates=["ts_utc"],
+    )
+
+
+def delete_subject_events(identifier_type: str, identifier_value: str) -> int:
+    if identifier_type not in {"visitor_id", "session_id"}:
+        return 0
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    f"""
+                    DELETE FROM {EVENT_TABLE}
+                    WHERE {identifier_type} = :identifier_value
+                    """
+                ),
+                {"identifier_value": identifier_value},
+            )
+            return result.rowcount or 0
+    except SQLAlchemyError as exc:
+        st.warning(f"Delete failed: {exc}")
+        return 0
+
+
 def render_overview(days: float, filter_sql: str) -> None:
     overview = get_overview_metrics(days, filter_sql)
     if overview.empty:
@@ -556,6 +675,88 @@ def render_geography(days: float, filter_sql: str) -> None:
     st.dataframe(df_countries, width="stretch", hide_index=True)
 
 
+def render_privacy_ops() -> None:
+    st.subheader("Privacy Ops")
+    st.caption("Operational controls for retention, transparency, and data-subject requests.")
+
+    metrics = get_privacy_metrics()
+    row = metrics.iloc[0].fillna(0).to_dict() if not metrics.empty else {}
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Retention", f"{ANALYTICS_RETENTION_DAYS} days")
+    col2.metric("Events", int(row.get("total_events", 0) or 0))
+    col3.metric("Past Retention", int(row.get("events_past_retention", 0) or 0))
+    col4.metric("Visitors", int(row.get("distinct_visitors", 0) or 0))
+
+    col5, col6, col7, col8 = st.columns(4)
+    col5.metric("Sessions", int(row.get("distinct_sessions", 0) or 0))
+    col6.metric("Page URLs", int(row.get("rows_with_page_url", 0) or 0))
+    col7.metric("Referrers", int(row.get("rows_with_referrer", 0) or 0))
+    col8.metric("User Agents", int(row.get("rows_with_user_agent", 0) or 0))
+
+    oldest_event = row.get("oldest_event")
+    newest_event = row.get("newest_event")
+    date_col1, date_col2 = st.columns(2)
+    date_col1.info(f"Oldest event: {oldest_event if oldest_event else 'none'}")
+    date_col2.info(f"Newest event: {newest_event if newest_event else 'none'}")
+
+    status_rows = pd.DataFrame(
+        [
+            {
+                "control": "Consent source",
+                "status": "Configured" if IUBENDA_PRIVACY_URL or IUBENDA_COOKIE_POLICY_URL else "Document outside dashboard",
+                "detail": IUBENDA_PRIVACY_URL or IUBENDA_COOKIE_POLICY_URL or "Add IUBENDA_PRIVACY_URL / IUBENDA_COOKIE_POLICY_URL for audit visibility.",
+            },
+            {
+                "control": "Retention enforcement",
+                "status": "Configured",
+                "detail": f"API deletes events older than {ANALYTICS_RETENTION_DAYS} days on startup.",
+            },
+            {
+                "control": "Admin API token",
+                "status": "Configured" if ANALYTICS_ADMIN_TOKEN_CONFIGURED else "Missing",
+                "detail": "Set ANALYTICS_ADMIN_TOKEN to unlock protected admin endpoints.",
+            },
+            {
+                "control": "Raw IP storage",
+                "status": "Minimized",
+                "detail": "The database stores country_code, not raw IP addresses.",
+            },
+        ]
+    )
+    st.dataframe(status_rows, width="stretch", hide_index=True)
+
+    st.divider()
+    st.markdown("#### Data-subject request")
+    identifier_type = st.radio("Identifier type", ["visitor_id", "session_id"], horizontal=True)
+    identifier_value = st.text_input("Identifier value", max_chars=128)
+
+    if not identifier_value:
+        return
+
+    subject_events = fetch_subject_events(identifier_type, identifier_value.strip())
+    st.metric("Matching Events", len(subject_events))
+
+    if subject_events.empty:
+        st.info("No events found for this identifier.")
+        return
+
+    st.download_button(
+        "Export CSV",
+        subject_events.to_csv(index=False).encode("utf-8"),
+        file_name=f"swallow-analysis-{identifier_type}.csv",
+        mime="text/csv",
+    )
+    st.dataframe(subject_events, width="stretch", hide_index=True)
+
+    confirm_delete = st.checkbox("I confirm this erasure request has been verified")
+    if st.button("Delete Matching Events", type="primary", disabled=not confirm_delete):
+        deleted_count = delete_subject_events(identifier_type, identifier_value.strip())
+        st.success(f"Deleted {deleted_count} events.")
+        st.cache_data.clear()
+        st.rerun()
+
+
 DATABASE_URL = build_database_url()
 if not DATABASE_URL:
     st.error("DATABASE_URL not found.")
@@ -564,6 +765,7 @@ if not DATABASE_URL:
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300, echo=False)
 
 st.set_page_config(page_title="Swallow Analytics", layout="wide")
+require_dashboard_auth()
 st.title("Swallow Analytics")
 st.caption("GA-style view over your custom event pipeline.")
 
@@ -596,7 +798,7 @@ render_overview(selected_days, filter_sql)
 render_realtime(filter_sql)
 render_trend(selected_days, filter_sql)
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Acquisition", "Pages", "Conversions", "Devices", "Geography"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Acquisition", "Pages", "Conversions", "Devices", "Geography", "Privacy"])
 with tab1:
     render_acquisition(selected_days, filter_sql)
     render_landing_pages(selected_days, filter_sql)
@@ -608,3 +810,5 @@ with tab4:
     render_devices(selected_days, filter_sql)
 with tab5:
     render_geography(selected_days, filter_sql)
+with tab6:
+    render_privacy_ops()
