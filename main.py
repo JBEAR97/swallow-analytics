@@ -47,11 +47,19 @@ BOT_PATTERNS = (
 ID_PATTERN = re.compile(r"^[a-zA-Z0-9._:-]{1,128}$")
 DEFAULT_RETENTION_DAYS = 180
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("❌ DATABASE_URL mancante!")
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://") :]
+    print("✅ Normalized DATABASE_URL to PostgreSQL dialect")
+
+if DATABASE_URL.startswith("postgresql://"):
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+else:
+    raise RuntimeError(f"❌ DATABASE_URL non valida: {DATABASE_URL.split('@')[1].split('/')[0] if '@' in DATABASE_URL else 'schema non riconosciuto'}")
+
 GEOIP_DB_PATH = os.path.join(os.path.dirname(__file__), "data", "GeoLite2-Country.mmdb")
 geoip_reader = None
 

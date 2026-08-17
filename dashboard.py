@@ -10,9 +10,11 @@ import pandas as pd
 import plotly.express as px
 import pycountry
 import streamlit as st
+from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
+load_dotenv()
 
 AUTO_REFRESH_SECONDS = 600
 ALL_TIME_DAYS_THRESHOLD = 10_000
@@ -678,6 +680,17 @@ def render_geography(days: float, filter_sql: str) -> None:
 def render_privacy_ops() -> None:
     st.subheader("Privacy Ops")
     st.caption("Operational controls for retention, transparency, and data-subject requests.")
+
+    if st.button("GDPR Readiness Summary"):
+        st.session_state.show_gdpr_summary = not st.session_state.get("show_gdpr_summary", False)
+
+    if st.session_state.get("show_gdpr_summary", False):
+        st.info(
+            "This dashboard supports GDPR operations by enforcing event retention, avoiding raw IP storage, "
+            "protecting admin views, documenting the Iubenda policy links, and providing export/delete tools "
+            "for data-subject requests. Final compliance still depends on your Iubenda consent setup, privacy "
+            "notice content, processor agreements, and internal handling of requests."
+        )
 
     metrics = get_privacy_metrics()
     row = metrics.iloc[0].fillna(0).to_dict() if not metrics.empty else {}
